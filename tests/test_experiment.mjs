@@ -1,0 +1,1011 @@
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
+const require = createRequire(import.meta.url);
+const ui = require("../frontend/experiment.js");
+const grid = ui.pointGrid();
+assert.equal(grid.length, 25);
+assert.deepEqual(grid[0], { id: "P01", row: 0, col: 0, u: 0, v: 0 });
+assert.deepEqual(grid[4], { id: "P05", row: 0, col: 4, u: 1, v: 0 });
+assert.deepEqual(grid[20], { id: "P21", row: 4, col: 0, u: 0, v: 1 });
+assert.deepEqual(grid[24], { id: "P25", row: 4, col: 4, u: 1, v: 1 });
+assert.equal(new Set(grid.map(point => point.id)).size, 25);
+assert.deepEqual(ui.visualPointGrid().slice(0, 5).map(point => point.id), ["P21", "P22", "P23", "P24", "P25"], "Top visual row is row 4 toward the fingertip");
+assert.deepEqual(ui.visualPointGrid().slice(-5).map(point => point.id), ["P01", "P02", "P03", "P04", "P05"], "Bottom visual row is row 0 with P01 at lower left");
+assert.equal(ui.COORDINATE_SCHEMA, "bottom_left_xy_v1");
+const legacyGrid = grid.map(point => ({ ...point, row: point.row + 1, col: point.col + 1 }));
+const legacyBefore = JSON.stringify(legacyGrid);
+const legacyLayout = ui.pointLayout({ point_grid: legacyGrid }, true);
+assert.equal(legacyLayout.current, false);
+assert.deepEqual(legacyLayout.visual.map(point => point.id), grid.map(point => point.id), "Historical stored visual order is preserved");
+assert.equal(legacyLayout.points[0].row, 1, "Historical one-based rows must not be relabeled as current zero-based rows");
+assert.equal(JSON.stringify(legacyGrid), legacyBefore, "Rendering must not rewrite historical coordinates");
+assert.equal(ui.pointLayout({}, true).known, false, "Missing historical geometry must remain unknown");
+const coordinateDefinition = { schema: "bottom_left_xy_v1", origin: "bottom_left", row_index_base: 0, col_index_base: 0, x_positive: "right", y_positive: "fingertip_up", finger_pad_up_in_px6d: [0, 0, -1] };
+assert.equal(ui.pointLayout({ point_grid: grid, coordinate_definition: coordinateDefinition }, true).visual[0].id, "P21");
+const guided = { enabled: true, step: "ready", message: "本轮标定已就绪，请开始采集。", repetitions_per_point: 3, accepted_by_point: {}, attempts_by_point: {}, current_round: 1, point_accepted: 0, point_attempts: 0, total_accepted: 0, total_required: 75, progress_percent: 0, point_progress_percent: 0, force_progress_percent: 0, last_quality: null, complete: false };
+const state = { version: "0.7.1", running: true, mode: "hardware", force_connected: true, experiment: { session_id: "current-session", running: true, point_id: "P01", phase: "idle", baseline: { ready: true }, guided, settings: { force_direction_confirmed: true, coordinates_confirmed: true } }, analysis: {} };
+assert.equal(ui.experimentGates(state).trialStart, true);
+assert.equal(ui.experimentGates({ ...state, experiment: { ...state.experiment, settings: {} } }).trialStart, false);
+assert.equal(ui.experimentGates({ ...state, experiment: { ...state.experiment, phase: "loading" } }).point, false);
+assert.equal(ui.experimentGates({ ...state, experiment: { ...state.experiment, running: false, phase: "loading" } }).hold, false);
+assert.equal(ui.experimentGates({ ...state, experiment: {} }).start, true);
+assert.equal(ui.experimentGates({ ...state, experiment: {}, analysis: { busy: true, training: { status: "running", busy: true } } }).start, false, "CPU training blocks a new acquisition session");
+assert.equal(ui.experimentGates({ ...state, experiment: {}, analysis: { busy: false, training: { status: "completed", busy: false } } }).start, true, "Completed training restores acquisition without changing other gates");
+assert.equal(ui.experimentGates({ ...state, force_connected: false, experiment: {} }).start, false);
+assert.equal(ui.experimentGates({ ...state, experiment: {} }).point, true, "Grid may be preselected before a session");
+assert.equal(ui.experimentGates({ ...state, experiment: { ...state.experiment, point_id: null, guided: { ...guided, step: "select_point" } } }).baseline, false);
+assert.equal(ui.experimentGates({ ...state, experiment: { ...state.experiment, guided: { ...guided, step: "round_complete" } } }).trialStart, false, "Every next round needs an explicit new baseline");
+assert.equal(ui.experimentGates({ ...state, experiment: { ...state.experiment, phase: "idle", trial_id: "T1", guided: { ...guided, step: "checking" } } }).pointConfirm, false);
+assert.equal(ui.experimentGates({ ...state, experiment: { ...state.experiment, guided: { ...guided, step: "point_complete" } } }).baseline, false);
+assert.equal(ui.experimentGates(state, false, "P02").trialStart, false, "Unconfirmed local point cannot use another point's ready baseline");
+assert.equal(ui.REQUIRED_SERVICE_VERSION,"0.7.1");
+for(const version of [undefined,"0.3.1","0.4.0","0.4.1","0.4.2","0.4.3","0.4.4","0.5.0","0.5.1","0.5.2","0.6.0","0.6.1","0.6.2","0.7.0"]) {
+  const incompatible={...state,version}, gated=ui.experimentGates(incompatible);
+  assert.equal(ui.backendCompatible(incompatible),false);
+  for(const action of ["start","point","pointConfirm","baseline","trialStart","abort"]) assert.equal(gated[action],false,`${version || "unverified"} cannot use ${action}`);
+  assert.equal(gated.stop,true,"An incompatible active experiment can still be explicitly stopped and saved");
+}
+assert.equal(ui.experimentGates({...state,version:"0.3.1",experiment:{},recording:true,session:{closed:false}}).stop,true,"An active old raw recorder has an explicit controlled save-and-stop path");
+assert.equal(ui.experimentGates({...state,version:"0.3.1",experiment:{},recording:false,session:null}).stop,false);
+assert.equal(ui.repetitionsValue("3"), 3);
+assert.equal(ui.repetitionsValue("999"), 999);
+for (const value of ["", "2", "3.5", "1000", "abc"]) assert.throws(() => ui.repetitionsValue(value), /3～999 的整数/);
+assert.equal(ui.guidedView({}).totalPercent, 0);
+assert.equal(ui.guidedView({ guided: { ...guided, progress_percent: 100, complete: true } }).complete, false, "Without a real session no progress/completion may be shown");
+assert.equal(ui.guidedView({ session_id: "actual", guided: { ...guided, progress_percent: 100, complete: false } }).complete, false, "A percentage must never manufacture completion");
+const preload = { schema: "preload_diagnostics_v1", elapsed_ms: 1200, valid_continuous_ms: 250, reset_count: 4, last_block_reason: "PX6D 插值两端距离光谱采集时间过远", timeout_ms: 8000, target_ms: 500, timed_out: false };
+assert.equal(ui.preloadView({ guided: { ...guided, step: "preload", preload } }).visible, false, "Without a real session preload diagnostics cannot imply acquisition");
+assert.equal(ui.preloadView({ session_id: "real", guided: { ...guided, step: "preload", preload } }).percent, 50);
+assert.equal(ui.preloadView({ session_id: "real", guided: { ...guided, step: "preload", preload: { ...preload, elapsed_ms: 9000, valid_continuous_ms: 900 } } }).timedOut, false, "Only the server declares timeout; elapsed time cannot change the stage");
+assert.equal(ui.preloadView({ session_id: "real", guided: { ...guided, step: "preload", preload: { ...preload, elapsed_ms: -1, valid_continuous_ms: NaN, reset_count: -1 } } }).continuous, null);
+assert.equal(ui.preloadView({ session_id: "real", guided: { ...guided, step: "ready", preload } }).visible, false);
+assert.equal(ui.preloadView({ session_id: "real", guided: { ...guided, step: "retry", preload: { ...preload, timed_out: true } } }).visible, true, "A server-declared timeout stays visible until new calibration");
+assert.match(ui.roundQualityText({ accepted: false, reasons: ["目标力未达到", "人工异常"] }), /不计入.*卸载后手动标定重采.*目标力未达到.*人工异常/);
+assert.match(ui.roundQualityText({ accepted: true, reasons: [] }), /采集检查通过/);
+for (const status of ["无接触", "定位不确定", "超范围", "无效"]) {
+  const prediction = ui.predictionView({ status, point_id: "P01", force_N: 1, truth_force_N: .5 });
+  assert.equal(prediction.point, null);
+  assert.equal(prediction.force, null);
+  assert.equal(prediction.error, null);
+}
+assert.deepEqual(ui.predictionView({ status: "有效估计", point_id: "P02", force_N: 1.5, truth_force_N: 1, confidence: .8 }), { status: "有效估计", point: "P02", force: 1.5, truth: 1, error: .5, confidence: .8, reason: "载入真实模型并完成本次无接触参考后，才会显示有效估计。" });
+assert.equal(ui.predictionView({ status: "有效估计", point_id: "P26", force_N: 1 }).point, null);
+const activeAnalysis = { model_id: "real-model", model_kind: "full", test_reference: { ready: true }, trained_point_ids: grid.map(point => point.id) };
+const studyAnalysis = { model_definition: { point_grid: grid, coordinate_definition: coordinateDefinition, finger_id: "当前真实样件", force_sign: -1 }, model_id: "P-study", model_kind: "pilot", model_sha256: "study-hash", trained_point_ids: ["P01", "P05", "P21", "P25"], test_reference: { ready: true, pending: false, reference_version: 8 }, prediction: { status: "有效估计", point_id: "P05", force_N: 1.2, truth_force_N: 1, error_N: .2 } };
+assert.deepEqual(ui.trainedPointIDs(studyAnalysis), ["P01", "P05", "P21", "P25"]);
+assert.equal(ui.trainedPointIDs({ model_kind: "full" }).length, 25, "Full models retain all 25 trained positions");
+assert.deepEqual(ui.trainedPointIDs({ model_kind: "pilot" }), [], "Unknown research model coverage cannot be invented");
+assert.equal(ui.validationLiveView(studyAnalysis).point, "P05");
+for (const status of ["无接触", "定位不确定", "超范围", "无效"]) assert.equal(ui.validationLiveView({ ...studyAnalysis, prediction: { ...studyAnalysis.prediction, status } }).point, null);
+assert.equal(ui.validationLiveView(studyAnalysis, true).point, null, "A stale result cannot keep a lamp lit");
+assert.equal(ui.validationLiveView({ ...studyAnalysis, prediction: { ...studyAnalysis.prediction, point_id: "P02" } }).point, null, "Untrained positions cannot be lit");
+assert.equal(ui.validationLiveView({ ...studyAnalysis, test_reference: { ready: false } }).point, null, "A loaded model needs the explicitly established current reference");
+assert.equal(ui.validationLiveView({ ...studyAnalysis, prediction: { ...studyAnalysis.prediction, valid: false } }).valid, false);
+assert.equal(ui.validationLiveView({ ...studyAnalysis, prediction: { ...studyAnalysis.prediction, stale: true } }).valid, false);
+assert.equal(ui.validationLiveView({ ...studyAnalysis, prediction: { status: "定位不确定", comparison_ready: true, truth_force_N: 1 } }).comparisonReady, true, "Valid physical evidence may be frozen even when inference fails");
+assert.equal(ui.validationLiveView({ ...studyAnalysis, prediction: { ...studyAnalysis.prediction, comparison_ready: false } }).comparisonReady, false, "Explicit server evidence invalidation takes precedence over a numerical prediction");
+assert.equal(ui.forceWithinTolerance(1.3 - 1), true, "Exactly 0.3 N allows only floating point rounding, matching server enforcement");
+assert.equal(ui.forceWithinTolerance(.30001), false);
+assert.match(ui.modelOptionLabel({ model_id: "P-study", model_kind: "pilot", point_ids: ["P01", "P05"], data_id: "001中文", data_started_minute: "2026-10-10 14:39" }), /P-study.*少量点研究模型 · 2 点.*001中文.*14:39/);
+assert.match(ui.modelOptionLabel({ model_id: "P-study", model_kind: "pilot", data_started_utc: "2026-10-10T07:38:59Z", data_started_minute: "2026-10-10T07:38+00:00" }), /采集 2026-10-10 15:38$/, "Model acquisition timestamps use the same Beijing minute format as sessions");
+assert.match(ui.modelOptionLabel({ model_id: "P-study", data_started_minute: "2026-10-10T07:38+00:00" }), /采集 2026-10-10 15:38$/, "Offset-bearing minute metadata also converts instead of leaking raw UTC");
+assert.match(ui.targetComparison(null, ui.validationLiveView(studyAnalysis)), /请先点击/);
+assert.match(ui.targetComparison("P01", ui.validationLiveView(studyAnalysis)), /位置不一致/);
+assert.match(ui.targetComparison("P05", ui.validationLiveView(studyAnalysis)), /位置一致/);
+assert.match(ui.targetComparison("P05", ui.validationLiveView(studyAnalysis, true)), /待按压/);
+assert.match(ui.targetComparison("P05", ui.validationLiveView({ ...studyAnalysis, prediction: { ...studyAnalysis.prediction, comparison_ready: false } })), /位置一致/, "Live optical recognition can be compared with its target even while PX comparison evidence is unavailable");
+const sampleFixture = { sample_id: "V-test-1", model_id: "P-study", valid: true, created_utc: "2026-10-10T08:39:26Z", reference_version: 8, prediction: { ...studyAnalysis.prediction } };
+assert.equal(ui.frozenSampleView(sampleFixture).point, "P05");
+assert.equal(ui.frozenSampleView({ ...sampleFixture, valid: false }).valid, false);
+const rejectedSample = { ...sampleFixture, sample_id: "V-test-rejected", valid: true, inference_valid: false, reason: "定位不确定", prediction: { status: "定位不确定", point_id: null, force_N: null, truth_force_N: 1, error_N: null } };
+assert.equal(ui.frozenSampleView(rejectedSample).valid, true, "Data validity and inference success are separate");
+assert.equal(ui.frozenSampleView(rejectedSample).inferenceValid, false);
+assert.equal(ui.frozenSampleView(rejectedSample).force, null);
+assert.equal(ui.frozenSampleView({ ...sampleFixture, sample_id: "" }), null);
+assert.equal(ui.validationStatistics({ judged_total: 0, position_correct: 0, force_correct: 0, pending_count: 1, invalid_count: 2 }).positionRate, null, "No actual judged presses means no accuracy");
+assert.deepEqual(ui.validationStatistics({ judged_total: 4, position_correct: 3, force_correct: 2, pending_count: 1, invalid_count: 2 }), { total: 4, position: 3, force: 2, pending: 1, invalid: 2, positionRate: .75, forceRate: .5 });
+const curves = { point_curves: { P01: { trials: [{ trial_id: "t1", force_N: [0, 1, 2], x_pm: [[1, 2], [3, 4], [5, NaN]] }] } } };
+assert.deepEqual(ui.trialCurves(curves, "P01", 1)[0].samples, [{ force: 0, x: 2 }, { force: 1, x: 4 }]);
+assert.deepEqual(ui.trialCurves(curves, "P25", 0), []);
+assert.equal(ui.summaryRows({ methods: { linear: { overall: { joint_force: { mae_N: .1, rmse_N: .2, n: 20 }, classification_accuracy: .8 } } } }, "overall")[0].mae, .1);
+assert.equal(ui.summaryRows({ methods: { linear: { overall: { joint_force: { mae_N: .1, n: 20 } } } } }, "C")[0].metrics, null, "C must never inherit overall mixed scores");
+assert.equal(ui.defaultReportSplit({ methods: { linear: { by_split: { A: { n: 2 }, B: { n: 1 }, C: { n: 0 } } } } }), "B");
+assert.equal(ui.defaultReportSplit({ methods: { linear: { by_split: { C: { n: 3 } } } } }), "C");
+assert.equal(ui.liveForceView({ valid: true, force_N: 3.2, raw_Fz_N: -4.2, zero_Fz_N: -1, age_ms: 0 }).outside, true);
+assert.equal(ui.liveForceView({ valid: true, force_N: 1, age_ms: 20 }, 231).valid, false);
+assert.equal(ui.liveForceView({ valid: false, force_N: 1, age_ms: 0 }).force, null);
+const buildSessions = [{ session_id: "A-real", settings: { batch: "A" } }, { session_id: "B-real", settings: { batch: "B" } }, { session_id: "C-held-out", settings: { batch: "C" } }];
+assert.deepEqual(ui.modelSessionIDs(buildSessions, ["A-real", "B-real"]), ["A-real", "B-real"]);
+assert.throws(() => ui.modelSessionIDs(buildSessions, ["A-real", "B-real", "C-held-out"]), /取消 C 批.*独立会话/);
+assert.throws(() => ui.modelSessionIDs(buildSessions, ["A-real"]), /同时选择 A 批和 B 批/);
+assert.throws(() => ui.modelSessionIDs(buildSessions, ["missing"]), /批次不明/);
+assert.equal(ui.analysisProgressText({ session_id: "真实会话", processed: 42, total: 300 }), "正在离线补算 · 当前会话 真实会话 · 当前会话已补算 42/300 条光谱");
+assert.equal(ui.analysisProgressText({ stage: "生成特征表与分析研究模型" }), "生成特征表与分析研究模型");
+assert.ok(!ui.analysisProgressText({ session_id: "A", processed: 25, total: 100 }).includes("%"), "Current-session progress must not imply an overall percentage");
+assert.equal(ui.modelDefinitionText({ finger_id: "样件-原标识", force_sign: -1 }), "样件-原标识 · F = −(Fz − Fz₀)");
+assert.equal(ui.modelDefinitionText(null), "待加载");
+assert.match(ui.testReferenceText(null), /本次实机验证参考：尚未就绪/);
+assert.equal(ui.testReferenceText({ pending: true, ready: false, reference_version: 3, reason: "等待连续稳定九峰" }), "本次实机验证参考：正在建立 · 第 3 版 · 等待连续稳定九峰");
+assert.equal(ui.testReferenceText({ ready: true, pending: false, reference_version: 4, reason: "本次显式无接触确认" }), "本次实机验证参考：已就绪 · 第 4 版 · 本次显式无接触确认");
+assert.match(ui.testReferenceText({ ready: true, reference_version: 4 }, true), /本会话基线参考：已就绪 · 第 4 版/);
+const qualifiedSession = { session_id: "qualified", complete: true, has_training_data: true, accepted_trial_count: 12, settings: { batch: "A" }, started_utc: "2026-10-10T06:39:26Z" };
+const hiddenSession = { session_id: "newer-empty", complete: true, has_training_data: false, accepted_trial_count: 0, started_utc: "2026-10-11T06:39:26Z" };
+assert.equal(ui.sessionHasTrainingData(qualifiedSession), true);
+for (const patch of [{ complete: false }, { has_training_data: false }, { accepted_trial_count: 0 }, { accepted_trial_count: "12" }]) assert.equal(ui.sessionHasTrainingData({ ...qualifiedSession, ...patch }), false);
+assert.deepEqual(ui.visibleSessions([qualifiedSession, hiddenSession, { complete: true }]), [qualifiedSession], "Files saved or unknown historical metadata must not imply qualified presses");
+assert.equal(ui.visibleSessions([qualifiedSession, hiddenSession], true).length, 2, "Diagnostics remain accessible and preserved");
+assert.equal(ui.latestEffectiveSession([hiddenSession, qualifiedSession]), qualifiedSession, "A newer empty session cannot displace actual qualified data");
+assert.equal(ui.latestEffectiveSession([hiddenSession]), null);
+assert.equal(ui.sessionTimeText(qualifiedSession.started_utc), "2026-10-10 14:39");
+assert.ok(!ui.sessionTimeText(qualifiedSession.started_utc).includes("14:39:26"), "Acquisition timestamps are displayed to the minute");
+assert.equal(ui.sessionTimeText("invalid"), "时间未记录");
+assert.deepEqual(ui.sessionPointSummary({ point_summary: [{ point_id: "P01", row: 1, col: 1, attempts: 5, accepted: 3 }, { point_id: "P25", row: null, col: null, attempts: 1, accepted: 0 }] }), [{ id: "P01", accepted: 3, attempts: 5, location: "行 1 / 列 1" }, { id: "P25", accepted: 0, attempts: 1, location: "历史方向未记录" }], "Historical stored row/column values are never remapped");
+assert.deepEqual(ui.pilotSessionIDs([qualifiedSession], ["qualified"]), ["qualified"]);
+assert.throws(() => ui.pilotSessionIDs([qualifiedSession, hiddenSession], ["newer-empty"]), /合格按压/);
+assert.throws(() => ui.pilotSessionIDs([{ ...qualifiedSession, settings: { batch: "C" } }], ["qualified"]), /取消 C 批/);
+assert.throws(() => ui.pilotSessionIDs([qualifiedSession, { ...qualifiedSession, session_id: "second", settings: { batch: "B" } }], ["qualified", "second"]), /仅选择一个/);
+// Active history supports multiple candidates; combined per-point trial counts
+// are validated by the backend rather than rejecting partial source records.
+const partialA = { ...qualifiedSession, session_id: "partial-A", trainable: true, accepted_trial_count: 1 };
+const partialB = { ...qualifiedSession, session_id: "partial-B", trainable: true, accepted_trial_count: 2, settings: { batch: "B" } };
+assert.deepEqual(ui.historyTrainingIDs([partialA, partialB], ["partial-A", "partial-B"]), ["partial-A", "partial-B"]);
+assert.throws(() => ui.historyTrainingIDs([partialA], []), /勾选/);
+for (const patch of [{ deleted: true }, { diagnostic: true }, { complete: false }, { trainable: false, history_error: "原始文件核验失败" }, { settings: { batch: "C" } }]) {
+  assert.throws(() => ui.historyTrainingIDs([partialA, { ...partialB, ...patch }], ["partial-A", "partial-B"]), /不会静默跳过/);
+}
+assert.throws(() => ui.historyTrainingIDs([partialA], ["partial-A", "missing"]), /不会静默跳过/);
+assert.equal(ui.pilotReportView(curves).pilot, false);
+assert.match(ui.pilotReportView({ schema: "9fbg_pilot_cv_v1", scope: "within_session_whole_trial_cross_validation" }).scope, /同一会话内的整轮留出交叉验证.*跨天/);
+assert.ok(!ui.pilotReportView({ schema: "9fbg_pilot_cv_v1", scope: "within_session_whole_trial_cross_validation" }).scope.includes("within_session"), "Backend enum values must not leak into Chinese UI");
+assert.equal(ui.pilotReportView({ schema: "9fbg_pilot_cv_v1", summary: { n: 0, classification_accuracy: 1, force_mae_N: 0 } }).summary.accuracy, null, "Empty validation cannot display invented perfect accuracy");
+
+assert.equal(ui.trainingView({ status: "running", busy: true, progress_percent: 95, model_id: "not-yet-saved" }).complete, false);
+assert.equal(ui.trainingView({ status: "completed", progress_percent: 99, model_id: "incomplete" }).complete, false);
+assert.equal(ui.trainingView({ status: "completed", progress_percent: 100, model_id: "saved" }).complete, true);
+assert.equal(ui.trainingView({ status: "failed", progress_percent: 61 }).progress, 61);
+assert.equal(ui.validationResultView({ stats: { judged_total: 100, position_correct: 100 }, session_stats: { judged_total: 0 } }).positionRate, null);
+assert.equal(ui.validationResultView({ stats: { judged_total: 1, mae_N: .1, rmse_N: .2, force_error_count: 0 } }).mae, null, "Rejected-only rounds have no invented force error score");
+
+// Inert DOM/API: exercise actual buttons without instruments, files, or training.
+let finishedReport = null;
+let trainingFixture = { job_id: "training-test-1", busy: true, status: "running", progress_percent: 0, stage: "验证原始来源", method: "linear" };
+let modelFixtures = [{ model_id: "P-study", model_kind: "pilot", point_ids: ["P01", "P05", "P21", "P25"], data_id: "001研究数据", data_started_minute: "2026-10-10 14:39", created_local_minute: "2026-10-10 15:21", method: "linear", method_label: "加权最小二乘" }];
+let nextFreezeSample = sampleFixture;
+let validationBackend = { model_id: "P-study", model_sha256: "study-hash", pending_sample: null, stats: { judged_total: 0, position_correct: 0, force_correct: 0, pending_count: 0, invalid_count: 0 } };
+let listedSessions = [
+  { session_id: "real-A", complete: true, trial_count: 15, accepted_trial_count: 12, rejected_trial_count: 3, has_training_data: true, started_utc: "2026-10-10T06:39:26Z", ended_utc: "2026-10-10T07:00:00Z", repetitions_per_point: 3, acquisition_complete: false, settings: { batch: "A", finger_id: "实际样件6", data_id: "001-真实数据" }, point_summary: [ { point_id: "P01", row: 0, col: 0, attempts: 5, accepted: 3 }, { point_id: "P05", row: 0, col: 4, attempts: 4, accepted: 3 }, { point_id: "P21", row: 4, col: 0, attempts: 3, accepted: 3 }, { point_id: "P25", row: 4, col: 4, attempts: 3, accepted: 3 } ] },
+  { session_id: "real-B", complete: true, trial_count: 3, accepted_trial_count: 3, rejected_trial_count: 0, has_training_data: true, started_utc: "2026-10-10T05:39:26Z", ended_utc: "2026-10-10T06:00:00Z", settings: { batch: "B" } },
+  { session_id: "real-C", complete: true, trial_count: 3, accepted_trial_count: 3, rejected_trial_count: 0, has_training_data: true, started_utc: "2026-10-10T04:39:26Z", ended_utc: "2026-10-10T05:00:00Z", settings: { batch: "C" } },
+  { session_id: "diagnostic-newest", complete: true, trial_count: 2, accepted_trial_count: 0, rejected_trial_count: 2, has_training_data: false, diagnostic: true, started_utc: "2026-10-10T08:00:00Z", ended_utc: "2026-10-10T09:00:00Z", settings: { batch: "A", finger_id: "诊断样件" } },
+  { session_id: "empty-preserved", complete: true, trial_count: 0, accepted_trial_count: 0, rejected_trial_count: 0, has_training_data: false, settings: { batch: "A" } },
+  { session_id: "incomplete-preserved", complete: false, trial_count: 3, accepted_trial_count: 3, has_training_data: false, settings: { batch: "A" } },
+  { session_id: "protected-active", complete: false, trial_count: 0, accepted_trial_count: 0, has_training_data: false, deletable: false, history_error: "正在采集，不能删除", settings: { batch: "A" } }
+].map(row => ({ deleted: false, deletable: true, restorable: false, trainable: ui.sessionHasTrainingData(row) && row.settings?.batch !== "C", path: "测试夹具/" + row.session_id, ...row }));
+let deletedSessionFixtures = [{ ...listedSessions[1], session_id: "already-deleted", path: "测试回收区/already-deleted", deleted: true, deletable: false, restorable: true, trainable: false }];
+let historyFailure = false;
+const nodes = new Map(), handlers = new Map(), calls = [], intervals = [], preferenceBindings = [], savedPreferences = [];
+const context2d = new Proxy({}, { get: (target, key) => target[key] || (() => {}) });
+function node(id, tag = "") {
+  const item = { id, value: /value="([^"]*)"/.exec(tag)?.[1] || "", checked: /\bchecked\b/.test(tag), disabled: /\bdisabled\b/.test(tag), hidden: /\bhidden\b/.test(tag), textContent: "", style: {}, dataset: {}, _html: "", buttons: [], inputs: [],
+    setAttribute(name, value) { this[name] = value; },
+    addEventListener(type, callback) { handlers.set(id + ":" + type, callback); },
+    querySelectorAll(selector) { return selector.startsWith("input") ? this.inputs : this.buttons; },
+    getBoundingClientRect() { return { width: 600, height: 248 }; },
+    getContext() { return context2d; }
+  };
+  Object.defineProperty(item, "innerHTML", { get() { return this._html; }, set(value) {
+    this._html = value;
+    for (const match of value.matchAll(/<[^>]+\bid="([^"]+)"[^>]*>/g)) if (!nodes.has(match[1])) nodes.set(match[1], node(match[1], match[0]));
+    this.buttons = Array.from(value.matchAll(/<button[^>]*data-(point-id|target-point|open-session)="([^"]+)"[^>]*>/g), match => ({ dataset: { [({ "point-id": "pointId", "target-point": "targetPoint", "open-session": "openSession" })[match[1]]]: match[2], deleted: /data-deleted="([^"]+)"/.exec(match[0])?.[1] }, disabled: /\bdisabled\b/.test(match[0]), setAttribute(name, value) { this[name] = value; } }));
+    this.inputs = Array.from(value.matchAll(/<input[^>]*data-session-id="([^"]+)"[^>]*>/g), match => ({ dataset: { sessionId: match[1] }, checked: /\bchecked\b/.test(match[0]), disabled: /\bdisabled\b/.test(match[0]) }));
+    if (id === "expForceSign") this.value = "-1";
+    if (id === "expBatch") this.value = "A";
+    if (id === "expTrainingMethod") this.value = "linear";
+  } });
+  return item;
+}
+nodes.set("experimentWorkspace", node("experimentWorkspace"));
+let clock = 1000;
+class ClockDate extends Date { static now() { return clock; } }
+const browser = vm.createContext({
+  NineFBGPreferences: {
+    bind(section, mapping, afterRestore) { preferenceBindings.push({ section, mapping, afterRestore }); return Promise.resolve(); },
+    save(section, patch) { savedPreferences.push({ section, patch }); return Promise.resolve(); }
+  },
+  document: { getElementById(id) { assert.ok(nodes.has(id), "DOM target " + id); return nodes.get(id); } },
+  fetch: async (path, options = {}) => {
+    calls.push({ path, options });
+    let result;
+    if (path === "/api/validation/freeze") {
+      const actual = JSON.parse(options.body).actual_point_id;
+      const captured = { ...JSON.parse(JSON.stringify(nextFreezeSample)), target_point_id: actual, actual_point_id: actual };
+      validationBackend = { ...validationBackend, pending_sample: captured, stats: { ...validationBackend.stats, pending_count: 1 } };
+      result = { sample: JSON.parse(JSON.stringify(captured)), validation: JSON.parse(JSON.stringify(validationBackend)) };
+    } else if (path === "/api/validation/judge") {
+      const body = JSON.parse(options.body), stats = validationBackend.stats;
+      validationBackend = { ...validationBackend, pending_sample: null, stats: { ...stats, judged_total: stats.judged_total + 1, position_correct: stats.position_correct + Number(body.position_correct), force_correct: stats.force_correct + Number(body.force_correct), pending_count: 0 } };
+      result = { validation: JSON.parse(JSON.stringify(validationBackend)) };
+    } else if (path === "/api/validation/discard") {
+      validationBackend = { ...validationBackend, pending_sample: null, stats: { ...validationBackend.stats, pending_count: 0 } };
+      result = { validation: JSON.parse(JSON.stringify(validationBackend)) };
+    } else if (path === "/api/training/start") {
+      result = { job_id: trainingFixture.job_id, busy: true, training: JSON.parse(JSON.stringify(trainingFixture)) };
+    } else if (path === "/api/validation/finish") {
+      finishedReport ||= { report_id: "R-validation-test", path: "测试夹具/实机结果.json", created_utc: "2026-10-10T11:30:00Z", model_id: validationBackend.model_id, model_sha256: validationBackend.model_sha256, stats: JSON.parse(JSON.stringify(validationBackend.session_stats || validationBackend.stats)), session_id: "validation-round-test" };
+      validationBackend = { ...validationBackend, finished: true, latest_report: finishedReport };
+      result = { report: finishedReport, validation: JSON.parse(JSON.stringify(validationBackend)) };
+    } else if (path === "/api/history/sessions") {
+      result = { sessions: listedSessions, deleted_sessions: deletedSessionFixtures };
+    } else if (path === "/api/history/open") {
+      const body = JSON.parse(options.body), row = (body.deleted ? deletedSessionFixtures : listedSessions).find(item => item.session_id === body.session_id);
+      assert.ok(row, "Only listed fake history is opened");
+      result = { opened: true, path: row.path };
+    } else if (path === "/api/history/delete" || path === "/api/history/restore") {
+      if (historyFailure) return { ok: false, json: async () => ({ detail: "测试原子操作失败：全部记录保持原位" }) };
+      const ids = JSON.parse(options.body).session_ids, restoring = path.endsWith("restore");
+      const source = restoring ? deletedSessionFixtures : listedSessions;
+      const selected = ids.map(id => source.find(item => item.session_id === id));
+      assert.ok(selected.every(Boolean));
+      if (restoring) {
+        deletedSessionFixtures = deletedSessionFixtures.filter(row => !ids.includes(row.session_id));
+        listedSessions.push(...selected.map(row => ({ ...row, deleted: false, deletable: true, restorable: false, trainable: ui.sessionHasTrainingData(row) && row.settings?.batch !== "C" })));
+      } else {
+        listedSessions = listedSessions.filter(row => !ids.includes(row.session_id));
+        deletedSessionFixtures.push(...selected.map(row => ({ ...row, deleted: true, deletable: false, restorable: true, trainable: false })));
+      }
+      result = { sessions: listedSessions, deleted_sessions: deletedSessionFixtures, [restoring ? "restored_ids" : "deleted_ids"]: ids };
+    } else result = path === "/api/analysis/models" ? { models: modelFixtures } : { ok: true };
+    return { ok: true, json: async () => result };
+  },
+  setTimeout() { return 1; }, clearTimeout() {}, setInterval(callback) { intervals.push(callback); },
+  addEventListener() {}, Date: ClockDate, console
+});
+vm.runInContext(readFileSync(new URL("../frontend/experiment.js", import.meta.url), "utf8"), browser);
+const api = browser.NineFBGExperiment;
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const fire = async (id, type = "click", event = {}) => { assert.ok(handlers.has(id + ":" + type)); await handlers.get(id + ":" + type)(event); await flush(); };
+assert.equal(calls.length, 0, "Mount must not connect hardware or start recording");
+api.mount();
+assert.equal(intervals.length, 1, "Mount is idempotent");
+assert.deepEqual(preferenceBindings.map(item => item.section), ["experiment", "analysis"]);
+const experimentPreferences = preferenceBindings.find(item => item.section === "experiment");
+assert.deepEqual(Object.keys(experimentPreferences.mapping).sort(), ["finger_id", "batch", "force_sign", "data_id", "temperature_C", "fixation", "repetitions_per_point"].sort());
+assert.equal(nodes.has("expTipDiameter"), false, "The retired diameter field is not silently reused as a data ID");
+assert.equal(nodes.get("expDataID").value, "", "Data ID starts empty, not derived from a historical diameter");
+assert.deepEqual(Object.keys(preferenceBindings.find(item => item.section === "analysis").mapping).sort(), ["method"]);
+for (const id of ["expDirectionConfirmed", "expCoordinatesConfirmed", "expBaselineConfirmed", "expTestUnloaded"]) nodes.get(id).checked = true;
+experimentPreferences.afterRestore({ selected_point_id: "P04" });
+assert.equal(calls.length, 0, "Restoring preferences must not create a session or confirm a point");
+assert.match(nodes.get("expSelectedPoint").textContent, /^P04/);
+for (const id of ["expDirectionConfirmed", "expCoordinatesConfirmed", "expBaselineConfirmed", "expTestUnloaded"]) assert.equal(nodes.get(id).checked, false, "Confirmation cannot be restored: " + id);
+experimentPreferences.afterRestore({ selected_point_id: "P01" });
+assert.deepEqual(nodes.get("expPointMap").buttons.map(button => button.dataset.pointId).slice(0, 5), ["P21", "P22", "P23", "P24", "P25"]);
+assert.deepEqual(nodes.get("expPointMap").buttons.map(button => button.dataset.pointId).slice(-5), ["P01", "P02", "P03", "P04", "P05"]);
+assert.equal(nodes.get("expSelectedPoint").textContent, "P01 · 行 0 / 列 0");
+assert.equal(nodes.get("expTotalProgress").value, 0);
+assert.equal(nodes.get("expPointProgress").value, 0);
+assert.equal(nodes.get("expForceProgress").value, 0);
+assert.equal(nodes.has("expPanelTrial"), false, "Session and round acquisition share one page");
+for (const id of ["expTrialLoading", "expTrialHold", "expTrialRemoved", "expTrialRecovery", "expTrialFinish"]) assert.equal(nodes.has(id), false, "Retired manual phase button " + id);
+assert.match(nodes.get("expXAxisDirection").textContent, /→ 右/);
+assert.match(nodes.get("expYAxisDirection").textContent, /↑ 指尖/);
+assert.match(nodes.get("expPointMapDefinition").textContent, /左下 P01.*第 0 行.*−PX6D Z/);
+api.render({ ...state, experiment: { ...state.experiment, session_id: "historical-session", settings: { ...state.experiment.settings, point_grid: legacyGrid } } });
+assert.equal(nodes.get("expPointMap").buttons[0].dataset.pointId, "P01");
+assert.match(nodes.get("expSelectedPoint").textContent, /历史 行 1 \/ 列 1/);
+assert.match(nodes.get("expPointMapDefinition").textContent, /按其已存点阵保留/);
+api.render({ ...state, experiment: { ...state.experiment, session_id: "current-session", settings: { ...state.experiment.settings, point_grid: grid, coordinate_definition: coordinateDefinition } } });
+assert.equal(nodes.get("expPointMap").buttons[0].dataset.pointId, "P21");
+assert.equal(nodes.get("expPointMap").buttons[24].dataset.pointId, "P05");
+assert.equal(nodes.get("expSelectedPoint").textContent, "P01 · 行 0 / 列 0");
+assert.match(nodes.get("experimentWorkspace").innerHTML, /① 采集.*② 训练.*③ 实机验证/);
+for (const id of ["expTabAnalysis", "expPanelAnalysis", "expCurvePoint", "expCurveAxis", "expPointCurve", "expCurveEmpty", "expCurveLegend", "expCurveStatus", "expPointFitTable", "expReportSummary", "expReportMetrics", "expReportControls", "expReportDetails", "expPilotReport", "expPreviewBtn", "expBuildBtn", "expPilotBtn", "expEvaluateBtn", "expIncludeMLP", "expAnalysisMethod"]) assert.equal(nodes.has(id), false, "Retired analysis UI is removed rather than hidden: " + id);
+assert.equal(nodes.get("expTrainingProgress").hidden, true, "No invented progress before a service job exists");
+assert.equal(nodes.get("expTrainingResult").hidden, true);
+assert.equal(nodes.get("expValidationFinish").disabled, true);
+api.render({ ...state, experiment: {} });
+assert.equal(nodes.get("expStartBtn").disabled, false);
+nodes.get("expFingerID").value = "真实样件";
+nodes.get("expDataID").value = " 001-中文数据 ";
+nodes.get("expTemperature").value = "";
+nodes.get("expFixation").value = "固定装夹";
+nodes.get("expForceSign").value = "-1";
+nodes.get("expBatch").value = "A";
+nodes.get("expDirectionConfirmed").checked = true;
+nodes.get("expCoordinatesConfirmed").checked = true;
+nodes.get("expRepetitions").value = "2";
+const startsBeforeInvalid = calls.filter(call => call.path === "/api/experiment/start").length;
+nodes.get("expDataID").value = "   ";
+await fire("expStartBtn");
+assert.equal(calls.filter(call => call.path === "/api/experiment/start").length, startsBeforeInvalid);
+assert.match(nodes.get("expMessage").textContent, /数据编号/);
+nodes.get("expDataID").value = " 001-中文数据 ";
+await fire("expStartBtn");
+assert.equal(calls.filter(call => call.path === "/api/experiment/start").length, startsBeforeInvalid);
+assert.match(nodes.get("expMessage").textContent, /3～999 的整数/);
+nodes.get("expRepetitions").value = "3";
+const localPoint = nodes.get("expPointMap").buttons.find(button => button.dataset.pointId === "P02");
+const beforePreselect = calls.length;
+await fire("expPointMap", "click", { target: { closest: () => localPoint } });
+assert.equal(calls.length, beforePreselect, "Clicking the point grid is local selection only");
+assert.equal(savedPreferences.at(-1).section, "experiment");
+assert.equal(savedPreferences.at(-1).patch.selected_point_id, "P02");
+assert.match(nodes.get("expSelectedPoint").textContent, /^P02/);
+api.render({ ...state, experiment: {} });
+assert.match(nodes.get("expSelectedPoint").textContent, /^P02/, "Polling must not overwrite a local unconfirmed selection");
+await fire("expStartBtn");
+const start = calls.find(call => call.path === "/api/experiment/start");
+assert.ok(start);
+assert.equal(JSON.parse(start.options.body).force_sign, -1);
+assert.equal(JSON.parse(start.options.body).data_id, " 001-中文数据 ", "Data ID preserves leading zeros, Chinese and user-entered whitespace");
+assert.equal(JSON.parse(start.options.body).finger_id, "真实样件", "Data ID does not replace sample identity");
+assert.equal(Object.hasOwn(JSON.parse(start.options.body).conditions, "tip_diameter_mm"), false, "New data IDs are not sent as physical diameters");
+assert.equal(JSON.parse(start.options.body).force_direction_confirmed, true);
+assert.equal(JSON.parse(start.options.body).coordinates_confirmed, true);
+assert.equal(JSON.parse(start.options.body).conditions.temperature_C, null);
+assert.equal(JSON.parse(start.options.body).guided_acquisition, true);
+assert.equal(JSON.parse(start.options.body).repetitions_per_point, 3);
+assert.equal(JSON.parse(start.options.body).max_force_N, 3);
+assert.equal(calls.filter(call => call.path === "/api/experiment/point").length, 0, "Creating the session must not confirm the preselected point");
+api.render({ ...state, experiment: { ...state.experiment, point_id: null, baseline: {}, guided: { ...guided, step: "select_point" } } });
+assert.equal(nodes.get("expBaselineBtn").disabled, true);
+assert.equal(nodes.get("expTrialStart").disabled, true);
+assert.equal(nodes.get("expConfirmPointBtn").disabled, false);
+await fire("expConfirmPointBtn");
+assert.equal(calls.at(-1).path, "/api/experiment/point");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { point_id: "P02" });
+api.render({ ...state, experiment: { ...state.experiment, point_id: "P02", baseline: {}, guided: { ...guided, step: "needs_baseline" } } });
+nodes.get("expBaselineConfirmed").checked = true;
+await fire("expBaselineConfirmed", "change");
+await fire("expBaselineBtn");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { unloaded_confirmed: true });
+assert.equal(nodes.get("expBaselineConfirmed").checked, false);
+api.render({ ...state, experiment: { ...state.experiment, point_id: "P02" } });
+assert.equal(nodes.get("expTrialStart").disabled, false);
+experimentPreferences.afterRestore({ selected_point_id: "P25" });
+assert.match(nodes.get("expSelectedPoint").textContent, /^P02/, "Preference restore cannot switch a running session's point");
+const unconfirmedPoint = nodes.get("expPointMap").buttons.find(button => button.dataset.pointId === "P03");
+const beforeReadyPreselect = calls.length;
+await fire("expPointMap", "click", { target: { closest: () => unconfirmedPoint } });
+assert.equal(calls.length, beforeReadyPreselect);
+assert.equal(nodes.get("expTrialStart").disabled, true, "Selecting another local point must block starting under the confirmed old point ID");
+assert.equal(nodes.get("expBaselineBtn").disabled, true);
+api.render({ ...state, experiment: { ...state.experiment, point_id: "P02" } });
+assert.match(nodes.get("expSelectedPoint").textContent, /^P03/);
+assert.equal(nodes.get("expTrialStart").disabled, true);
+await fire("expPointMap", "click", { target: { closest: () => nodes.get("expPointMap").buttons.find(button => button.dataset.pointId === "P02") } });
+assert.equal(nodes.get("expTrialStart").disabled, false);
+await fire("expTrialStart");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { action: "start" });
+const callsBeforeAutomatic = calls.length;
+api.render({ ...state, experiment: { ...state.experiment, phase: "preload", trial_id: "T1", guided: { ...guided, step: "preload", message: "请保持无接触，正在预采样。", point_attempts: 1, preload } } });
+assert.equal(nodes.get("expConfirmPointBtn").disabled, true);
+assert.equal(nodes.get("expPointMap").buttons.every(button => button.disabled), true);
+assert.equal(nodes.get("expTrialAbort").disabled, false);
+assert.match(nodes.get("expGuidedMessage").textContent, /保持无接触/);
+assert.equal(nodes.get("expPreloadStatus").hidden, false);
+assert.equal(nodes.get("expPreloadProgress").value, 250);
+assert.equal(nodes.get("expPreloadProgress").max, 500);
+assert.match(nodes.get("expPreloadProgressText").textContent, /250 \/ 500 ms · 50%/);
+assert.match(nodes.get("expPreloadElapsed").textContent, /已等待：1\.2 s.*超时上限 8\.0 s/);
+assert.equal(nodes.get("expPreloadResets").textContent, "计时重置：4 次");
+assert.match(nodes.get("expPreloadBlockReason").textContent, /PX6D 插值两端距离光谱采集时间过远/);
+assert.equal(nodes.get("expPreloadTimeout").hidden, true);
+clock += 500; intervals[0]();
+assert.equal(nodes.get("expPreloadProgress").value, 250, "Browser time cannot advance the valid continuous sample window");
+assert.match(nodes.get("expPreloadElapsed").textContent, /已等待：1\.2 s/, "Elapsed time also comes only from service diagnostics");
+api.render({ ...state, experiment: { ...state.experiment, phase: "preload", trial_id: "T1", guided: { ...guided, step: "preload", preload: { ...preload, elapsed_ms: 1600, valid_continuous_ms: 0, reset_count: 5 } } } });
+assert.equal(nodes.get("expPreloadProgress").value, 0, "A blocked sample resets, rather than retaining, the last maximum");
+assert.equal(nodes.get("expPreloadResets").textContent, "计时重置：5 次");
+assert.equal(calls.length, callsBeforeAutomatic, "Diagnostic updates cannot automatically start loading or retry");
+api.render({ ...state, experiment: { ...state.experiment, phase: "loading", trial_id: "T1", guided: { ...guided, step: "loading", message: "请缓慢加载至 3 N。", force_progress_percent: 45, point_attempts: 1 } } });
+assert.equal(nodes.get("expPreloadStatus").hidden, true);
+assert.equal(nodes.get("expForceProgress").value, 45);
+clock += 500; intervals[0]();
+assert.equal(nodes.get("expForceProgress").value, 45, "A clock cannot advance server loading progress");
+api.render({ ...state, experiment: { ...state.experiment, phase: "hold", trial_id: "T1", guided: { ...guided, step: "unloading", message: "加载完成，请卸载。", force_progress_percent: 100 } } });
+assert.match(nodes.get("expGuidedMessage").textContent, /加载完成，请卸载/);
+api.render({ ...state, experiment: { ...state.experiment, phase: "recovery", trial_id: "T1", guided: { ...guided, step: "checking", message: "等待本轮采集检查结果。" } } });
+assert.equal(nodes.get("expConfirmPointBtn").disabled, true);
+assert.equal(calls.length, callsBeforeAutomatic, "Server stage updates never cause local phase API calls");
+await fire("expTrialAbort");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { action: "abort" });
+api.render({ ...state, experiment: { ...state.experiment, phase: "idle", guided: { ...guided, step: "retry", message: "本轮未通过，请卸载后重采。", point_attempts: 1, last_quality: { accepted: false, reasons: ["目标力未达到"] } } } });
+assert.equal(nodes.get("expTotalProgress").value, 0);
+assert.equal(nodes.get("expPointProgress").value, 0);
+assert.match(nodes.get("expRoundQuality").textContent, /不计入.*目标力未达到/);
+assert.match(nodes.get("expRoundLabel").textContent, /第 1 \/ 3 轮/);
+assert.equal(nodes.get("expTrialStart").disabled, true);
+nodes.get("expBaselineConfirmed").checked = true;
+const timedOutState = { ...state, experiment: { ...state.experiment, phase: "idle", baseline: { ready: false }, guided: { ...guided, step: "retry", message: "预采样超时，请重新明确确认无载并手动标定。", point_attempts: 1, preload: { ...preload, elapsed_ms: 8000, valid_continuous_ms: 0, reset_count: 16, timed_out: true }, last_quality: { accepted: false, reasons: ["预采样超过 8 秒未取得连续有效无载同步"] } } } };
+api.render(timedOutState);
+assert.equal(nodes.get("expPreloadStatus").hidden, false);
+assert.match(nodes.get("expPreloadStatus").className, /error/);
+assert.equal(nodes.get("expPreloadTimeout").hidden, false);
+assert.match(nodes.get("experimentWorkspace").innerHTML, /预采样超时，本轮失败且不计数.*重新明确确认无载并手动标定/);
+assert.equal(nodes.get("expBaselineConfirmed").checked, false, "Timeout requires a fresh operator unloaded confirmation");
+assert.equal(nodes.get("expBaselineBtn").disabled, true);
+assert.equal(nodes.get("expTrialStart").disabled, true);
+assert.equal(nodes.get("expTotalProgress").value, 0);
+nodes.get("expBaselineConfirmed").checked = true;
+api.render(timedOutState);
+assert.equal(nodes.get("expBaselineBtn").disabled, false, "Fresh confirmation enables manual calibration while the timeout report remains visible");
+assert.equal(nodes.get("expTrialStart").disabled, true, "Fresh confirmation cannot substitute for a new server baseline");
+assert.equal(calls.length, callsBeforeAutomatic + 1, "Timeout never submits a retry, calibration or synthetic result");
+await fire("expBaselineBtn");
+assert.equal(calls.at(-1).path, "/api/experiment/baseline", "Only an explicit operator click requests recalibration");
+assert.equal(nodes.get("expBaselineConfirmed").checked, false);
+api.render({ ...state, experiment: { ...state.experiment, guided: { ...guided, preload: null } } });
+assert.equal(nodes.get("expPreloadStatus").hidden, true, "A new baseline clears the previous round diagnostics");
+api.render({ ...state, experiment: { ...state.experiment, phase: "idle", guided: { ...guided, step: "round_complete", message: "采集检查通过，请标定下一轮。", point_accepted: 1, point_attempts: 2, current_round: 2, total_accepted: 1, progress_percent: 1.333, point_progress_percent: 33.333, accepted_by_point: { P01: 1 }, last_quality: { accepted: true, reasons: [] } } } });
+assert.equal(nodes.get("expPointProgress").value, 33.333);
+assert.equal(nodes.get("expTotalProgress").value, 1.333);
+assert.match(nodes.get("expRoundLabel").textContent, /P01.*第 2 \/ 3 轮/);
+assert.match(nodes.get("expAttemptLabel").textContent, /尝试 2 次.*已通过 1 次/);
+assert.match(nodes.get("expRoundQuality").textContent, /采集检查通过/);
+assert.equal(nodes.get("expTrialStart").disabled, true, "A successful round cannot reuse its baseline to start again");
+assert.equal(nodes.get("expBaselineConfirmed").checked, false);
+api.render({ ...state, experiment: { ...state.experiment, phase: "idle", guided: { ...guided, step: "point_complete", message: "P01 已完成，请选择下一采集点。", point_accepted: 3, point_attempts: 4, current_round: 3, total_accepted: 3, progress_percent: 4, point_progress_percent: 100, accepted_by_point: { P01: 3 } } } });
+assert.equal(nodes.get("expPointProgress").value, 100);
+assert.equal(nodes.get("expTotalProgress").value, 4);
+assert.equal(nodes.get("expBaselineBtn").disabled, true);
+assert.equal(nodes.get("expTrialStart").disabled, true);
+assert.equal(nodes.get("expConfirmPointBtn").disabled, false);
+assert.match(nodes.get("expPointMap").innerHTML, /point-complete/);
+api.render({ ...state, experiment: { ...state.experiment, phase: "idle", guided: { ...guided, step: "session_complete", message: "25 点采集检查已完成，请保存会话。", point_accepted: 3, current_round: 3, total_accepted: 75, progress_percent: 100, point_progress_percent: 100, complete: true } } });
+assert.equal(nodes.get("expTotalProgress").value, 100);
+assert.match(nodes.get("expGuidedMessage").className, /success/);
+assert.equal(nodes.get("expTrialStart").disabled, true);
+api.render({ ...state, experiment: {}, analysis: { ...activeAnalysis, prediction: { status: "有效估计", point_id: "P01", force_N: 1.2, truth_force_N: 1 } } });
+assert.equal(nodes.get("expPredictionPoint").textContent, "P01");
+assert.equal(nodes.get("expPredictionForce").textContent, "1.200");
+nodes.get("expTestUnloaded").checked = true; await fire("expTestUnloaded", "change");
+await fire("expTestReferenceBtn");
+assert.equal(calls.at(-1).path, "/api/analysis/reference");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { unloaded_confirmed: true });
+api.render({ ...state, experiment: { ...state.experiment, live_force: { valid: true, force_N: 3.2, raw_Fz_N: -4.2, zero_Fz_N: -1, age_ms: 0 } }, analysis: { ...activeAnalysis, prediction: { status: "有效估计", point_id: "P01", force_N: 1.2, truth_force_N: 1 } } });
+assert.equal(nodes.get("expLiveForceValue").textContent, "3.200", "Provisional range must not clip the real loading force");
+assert.match(nodes.get("expLiveForceReason").textContent, /超过 3 N/);
+assert.match(nodes.get("expLiveForceRaw").textContent, /-4.200.*-1.000/);
+clock += 251; intervals[0]();
+assert.equal(nodes.get("expLiveForceValue").textContent, "—", "Latest force has its own 250 ms freshness gate");
+assert.equal(nodes.get("expPredictionPoint").textContent, "P01", "Force is only a comparison, not a prediction input");
+clock += 1501; intervals[0]();
+assert.equal(nodes.get("expPredictionPoint").textContent, "—");
+assert.equal(nodes.get("expPredictionTruth").textContent, "—");
+assert.equal(nodes.get("expTrialStart").disabled, true);
+assert.equal(nodes.get("expTestReferenceBtn").disabled, true);
+assert.match(nodes.get("expPredictionState").textContent, /状态过期/);
+nodes.get("expForceSign").value = "1"; await fire("expForceSign", "change");
+assert.equal(nodes.get("expDirectionConfirmed").checked, false);
+assert.match(nodes.get("expDirectionDescription").textContent, /F = \+/);
+// History displays all preserved data and trains all explicitly selected candidates.
+api.render({ ...state, experiment: {}, analysis: {} });
+await fire("expTabTraining");
+assert.equal(nodes.get("expPanelTraining").hidden, false);
+assert.equal(nodes.get("expPanelSession").hidden, true);
+assert.match(nodes.get("expSessionList").innerHTML, /样件 实际样件6.*数据编号 001-真实数据.*合格按压 12 轮/);
+assert.match(nodes.get("expSessionList").innerHTML, /开始 2026.*14:39/);
+assert.match(nodes.get("expSessionList").innerHTML, /P01 · 行 0 \/ 列 0 · 合格 3 \/ 尝试 5 轮/);
+assert.match(nodes.get("expSessionList").innerHTML, /P25 · 行 4 \/ 列 4 · 合格 3 \/ 尝试 3 轮/);
+assert.match(nodes.get("expSessionList").innerHTML, /数据编号 未编号/);
+assert.match(nodes.get("expSessionList").innerHTML, /diagnostic-newest/);
+assert.match(nodes.get("expSessionList").innerHTML, /empty-preserved/);
+assert.match(nodes.get("expSessionList").innerHTML, /incomplete-preserved/);
+assert.match(nodes.get("expSessionList").innerHTML, /不可训练/);
+assert.match(nodes.get("expSessionList").innerHTML, /测试夹具\/real-A/);
+assert.equal(nodes.get("expSessionList").buttons.length, listedSessions.length);
+assert.ok(!nodes.get("expSessionList").innerHTML.includes(" checked"));
+assert.match(nodes.get("expSessionList").innerHTML, /type="checkbox"[^>]*data-session-id/);
+assert.ok(!nodes.get("expSessionList").innerHTML.includes('type="radio"'));
+assert.equal(nodes.get("expTrainingStart").disabled, true);
+const beforeSelectAll = calls.length;
+await fire("expSelectTrainable");
+assert.equal(calls.length, beforeSelectAll);
+assert.match(nodes.get("expSessionList").innerHTML, /data-session-id="real-A" checked/);
+assert.match(nodes.get("expSessionList").innerHTML, /data-session-id="real-B" checked/);
+assert.match(nodes.get("expHistorySelectionState").textContent, /已选择 2 条/);
+await fire("expClearSessions");
+const selectHistory = async (id, checked = true) => fire("expSessionList", "change", { target: { dataset: { sessionId: id }, checked } });
+await selectHistory("real-A"); await selectHistory("real-B");
+assert.match(nodes.get("expSessionList").innerHTML, /data-session-id="real-A" checked/);
+assert.match(nodes.get("expSessionList").innerHTML, /data-session-id="real-B" checked/, "Selecting another checkbox preserves earlier selection");
+assert.equal(nodes.get("expTrainingStart").disabled, false);
+const methodPreferences = preferenceBindings.find(item => item.section === "analysis");
+nodes.get("expTrainingMethod").value = "piecewise"; methodPreferences.afterRestore({ method: "piecewise" });
+assert.equal(nodes.get("expTrainingMethod").value, "linear", "A historical retired method does not become an invalid new training method");
+const beforeTrain = calls.length;
+await fire("expTrainingStart");
+assert.deepEqual(calls.slice(beforeTrain).map(call => call.path), ["/api/training/start"]);
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { session_ids: ["real-A", "real-B"], method: "linear" });
+assert.equal(nodes.get("expTrainingStart").disabled, true);
+assert.equal(nodes.get("expTrainingProgress").value, 0);
+api.render({ ...state, experiment: {}, analysis: { busy: true, training: { ...trainingFixture, progress_percent: 34, stage: "补算光谱 120 / 300" } } });
+assert.equal(nodes.get("expStartBtn").disabled, true, "The acquisition tab also reflects active training");
+assert.equal(nodes.get("expTrainingProgress").value, 34);
+clock += 1000; intervals[0]();
+assert.equal(nodes.get("expTrainingProgress").value, 34, "Browser time cannot advance actual training progress");
+assert.match(nodes.get("expTrainingStage").textContent, /补算光谱 120 \/ 300/);
+api.render({ ...state, experiment: {}, analysis: { training: { ...trainingFixture, method: "mlp", method_label: "小型 MLP", progress_percent: 65, stage: "拟合神经网络", epoch: 25, epochs: 100, fold: 2, fold_count: 3 } } });
+assert.match(nodes.get("expTrainingIteration").textContent, /实际迭代 25 \/ 100.*折 2 \/ 3/);
+assert.equal(nodes.get("expTrainingResult").hidden, true);
+api.render({ ...state, experiment: {}, analysis: { training: { ...trainingFixture, busy: false, status: "failed", progress_percent: 65, error: "训练失败：有效整轮不足" } } });
+assert.equal(nodes.get("expTrainingProgress").value, 65);
+assert.match(nodes.get("expTrainingState").textContent, /训练失败/);
+assert.equal(nodes.get("expTrainingError").hidden, false);
+assert.match(nodes.get("expTrainingError").textContent, /有效整轮不足/);
+assert.equal(nodes.get("expTrainingResult").hidden, true);
+assert.equal(nodes.get("expGoValidation").disabled, true);
+nodes.get("expTrainingMethod").value = "mlp";
+trainingFixture = { ...trainingFixture, job_id: "training-test-2", method: "mlp", method_label: "小型 MLP" };
+await fire("expTrainingStart");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { session_ids: ["real-A", "real-B"], method: "mlp" });
+modelFixtures.push({ model_id: "P-new-mlp", model_kind: "pilot", method: "mlp", method_label: "小型 MLP", point_ids: ["P01", "P05", "P21", "P25"], created_local_minute: "2026-10-10 19:30", data_id: "001-真实数据" });
+const completedJob = { job_id: "training-test-2", busy: false, status: "completed", progress_percent: 100, stage: "模型与内部记录已保存", model_id: "P-new-mlp", method: "mlp", method_label: "小型 MLP", point_ids: ["P01", "P05", "P21", "P25"], created_local_minute: "2026-10-10 19:30" };
+const loadsBeforeCompletion = calls.filter(call => call.path === "/api/analysis/load").length;
+api.render({ ...state, experiment: {}, analysis: { busy: false, training: completedJob } });
+assert.equal(nodes.get("expStartBtn").disabled, false);
+await flush(); await flush();
+assert.equal(nodes.get("expTrainingResult").hidden, false);
+assert.equal(nodes.get("expTrainingModelID").textContent, "P-new-mlp");
+assert.equal(nodes.get("expTrainingModelMethod").textContent, "小型 MLP");
+assert.equal(nodes.get("expTrainingModelTime").textContent, "2026-10-10 19:30");
+assert.equal(nodes.get("expTrainingModelPoints").textContent, "P01 / P05 / P21 / P25");
+assert.equal(nodes.get("expModelSelect").value, "P-new-mlp");
+assert.match(nodes.get("expModelSelect").innerHTML, /小型 MLP.*训练 2026-10-10 19:30/);
+assert.equal(calls.filter(call => call.path === "/api/analysis/load").length, loadsBeforeCompletion, "Saving a trained model never silently replaces the live model");
+await fire("expGoValidation");
+assert.equal(nodes.get("expPanelTest").hidden, false);
+assert.equal(nodes.get("expModelSelect").value, "P-new-mlp");
+assert.equal(calls.filter(call => call.path === "/api/analysis/load").length, loadsBeforeCompletion);
+const modelFetches = calls.filter(call => call.path === "/api/analysis/models").length;
+api.render({ ...state, experiment: {}, analysis: { training: completedJob } }); await flush();
+assert.equal(calls.filter(call => call.path === "/api/analysis/models").length, modelFetches, "Completed-job polling does not repeatedly refresh models");
+
+// Invalid selections are reported as a whole, never silently dropped.
+await fire("expClearSessions"); await selectHistory("real-A");
+for (const id of ["diagnostic-newest", "real-C", "incomplete-preserved"]) {
+  await selectHistory(id);
+  const invalidTrainCalls = calls.length;
+  await fire("expTrainingStart");
+  assert.equal(calls.length, invalidTrainCalls);
+  assert.match(nodes.get("expMessage").textContent, /不会静默跳过/);
+  assert.match(nodes.get("expMessage").textContent, new RegExp(id));
+  assert.match(nodes.get("expSessionList").innerHTML, /data-session-id="real-A" checked/);
+  await selectHistory(id, false);
+}
+
+// Opening a location is a separate button action and does not alter selection.
+const openHistory = async id => fire("expSessionList", "click", { target: { closest: () => nodes.get("expSessionList").buttons.find(button => button.dataset.openSession === id) } });
+const beforeOpen = calls.length;
+await openHistory("real-A");
+assert.equal(calls.length, beforeOpen + 1);
+assert.equal(calls.at(-1).path, "/api/history/open");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { session_id: "real-A", deleted: false });
+assert.match(nodes.get("expHistorySelectionState").textContent, /已选择 1 条/);
+
+// Delete/restore operate only after an explicit app dialog; these APIs mutate
+// fake arrays only, never production files. Cancellation preserves selections.
+await fire("expClearSessions"); await selectHistory("real-A"); await selectHistory("diagnostic-newest");
+let historyCalls = calls.length;
+await fire("expDeleteSessions");
+assert.equal(calls.length, historyCalls);
+assert.equal(nodes.get("expHistoryDialog").hidden, false);
+assert.match(nodes.get("expHistoryDialogTitle").textContent, /删除所选 2 条/);
+assert.match(nodes.get("expHistoryDialogSummary").textContent, /可恢复回收区.*不永久删除/);
+assert.match(nodes.get("expHistoryDialogItems").innerHTML, /2026-10-10 14:39.*001-真实数据.*real-A/);
+assert.match(nodes.get("expHistoryDialogItems").innerHTML, /测试夹具\/real-A/);
+assert.match(nodes.get("expHistoryDialogItems").innerHTML, /diagnostic-newest/);
+assert.equal(nodes.get("expShowDeleted").disabled, true);
+assert.equal(nodes.get("expRefreshSessions").disabled, true);
+assert.ok(nodes.get("expSessionList").inputs.every(input => input.disabled));
+await selectHistory("real-B");
+assert.match(nodes.get("expHistorySelectionState").textContent, /已选择 2 条/, "Dialog binds the reviewed IDs, not later input events");
+await fire("expHistoryCancel");
+assert.equal(nodes.get("expHistoryDialog").hidden, true);
+assert.equal(calls.length, historyCalls);
+assert.match(nodes.get("expHistorySelectionState").textContent, /已选择 2 条/);
+await fire("expDeleteSessions");
+await fire("expHistoryDialog", "keydown", { key: "Escape", preventDefault() {} });
+assert.equal(nodes.get("expHistoryDialog").hidden, true);
+assert.equal(calls.length, historyCalls);
+
+// Atomic API failure leaves the records and the confirmation intact.
+historyFailure = true;
+await fire("expDeleteSessions"); await fire("expHistoryConfirm");
+assert.equal(calls.at(-1).path, "/api/history/delete");
+assert.equal(nodes.get("expHistoryDialog").hidden, false);
+assert.equal(nodes.get("expHistoryDialogError").hidden, false);
+assert.match(nodes.get("expHistoryDialogError").textContent, /全部记录保持原位/);
+assert.match(nodes.get("expHistorySelectionState").textContent, /已选择 2 条/);
+assert.ok(listedSessions.some(row => row.session_id === "real-A"));
+historyFailure = false;
+await fire("expHistoryConfirm");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { session_ids: ["real-A", "diagnostic-newest"] });
+assert.equal(nodes.get("expHistoryDialog").hidden, true);
+assert.match(nodes.get("expHistorySelectionState").textContent, /已选择 0 条/);
+assert.ok(!nodes.get("expSessionList").innerHTML.includes('data-session-id="real-A"'));
+assert.ok(deletedSessionFixtures.some(row => row.session_id === "real-A"));
+
+nodes.get("expShowDeleted").checked = true; await fire("expShowDeleted", "change");
+assert.match(nodes.get("expSessionList").innerHTML, /already-deleted/);
+assert.match(nodes.get("expSessionList").innerHTML, /已删除 · 可恢复/);
+assert.equal(nodes.get("expDeleteSessions").hidden, true);
+assert.equal(nodes.get("expRestoreSessions").hidden, false);
+await selectHistory("real-A"); await selectHistory("diagnostic-newest");
+assert.equal(nodes.get("expTrainingStart").disabled, true);
+historyCalls = calls.length;
+await fire("expTrainingStart");
+assert.equal(calls.length, historyCalls, "Trash records cannot be trained by forcing a disabled button");
+await openHistory("real-A");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { session_id: "real-A", deleted: true });
+historyCalls = calls.length;
+await fire("expRestoreSessions");
+assert.equal(calls.length, historyCalls);
+assert.match(nodes.get("expHistoryDialogTitle").textContent, /恢复所选 2 条/);
+await fire("expHistoryConfirm");
+assert.equal(calls.at(-1).path, "/api/history/restore");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { session_ids: ["real-A", "diagnostic-newest"] });
+assert.ok(listedSessions.some(row => row.session_id === "real-A"));
+assert.match(nodes.get("expHistorySelectionState").textContent, /已选择 0 条/);
+nodes.get("expShowDeleted").checked = false; await fire("expShowDeleted", "change");
+assert.match(nodes.get("expSessionList").innerHTML, /diagnostic-newest/);
+
+await selectHistory("protected-active");
+assert.equal(nodes.get("expDeleteSessions").disabled, true);
+historyCalls = calls.length;
+await fire("expDeleteSessions");
+assert.equal(calls.length, historyCalls);
+assert.equal(nodes.get("expHistoryDialog").hidden, true);
+assert.match(nodes.get("expMessage").textContent, /受保护/);
+await fire("expClearSessions"); await selectHistory("real-A");
+for (const blockedState of [{ ...state }, { ...state, experiment: {}, analysis: { busy: true, training: trainingFixture } }]) {
+  api.render(blockedState);
+  assert.equal(nodes.get("expDeleteSessions").disabled, true);
+  historyCalls = calls.length; await fire("expDeleteSessions");
+  assert.equal(calls.length, historyCalls);
+  assert.equal(nodes.get("expHistoryDialog").hidden, true);
+}
+api.render({ ...state, experiment: {}, analysis: {} });
+await fire("expDeleteSessions");
+api.render({ ...state, experiment: {}, analysis: { busy: true } });
+assert.equal(nodes.get("expHistoryConfirm").disabled, true);
+historyCalls = calls.length; await fire("expHistoryConfirm");
+assert.equal(calls.length, historyCalls, "A task starting after dialog review still blocks mutation");
+await fire("expHistoryCancel");
+api.render({ ...state, experiment: {}, analysis: {} });
+nodes.get("expShowDeleted").checked = true; await fire("expShowDeleted", "change");
+assert.match(nodes.get("expHistorySelectionState").textContent, /已选择 0 条/, "Active and deleted selections cannot mix");
+await selectHistory("already-deleted");
+api.render({ ...state, experiment: {}, analysis: { busy: true } });
+assert.equal(nodes.get("expRestoreSessions").disabled, true);
+historyCalls = calls.length; await fire("expRestoreSessions");
+assert.equal(calls.length, historyCalls);
+api.render({ ...state, experiment: {}, analysis: {} });
+nodes.get("expShowDeleted").checked = false; await fire("expShowDeleted", "change");
+
+api.render({ ...state, experiment: {}, analysis: { test_reference: { ready: false, pending: true, reason: "等待新的无接触参考版本", reference_version: 5 } } });
+assert.match(nodes.get("expTestReferenceState").textContent, /正在建立.*第 5 版/);
+api.render({ ...state, experiment: {}, analysis: { test_reference: { ready: true, pending: false, reason: "本次明确无接触确认已完成", reference_version: 6 } } });
+assert.match(nodes.get("expTestReferenceState").textContent, /本次实机验证参考：已就绪.*第 6 版/);
+assert.match(nodes.get("expTestReferenceState").className, /success/);
+
+// Only simulated API fixtures are used below: no hardware press or real
+// validation record is generated by these operator-flow regressions.
+const studyState = { ...state, experiment: {}, analysis: studyAnalysis, validation: validationBackend };
+const selectTarget = async point => fire("expValidationMap", "click", { target: { closest: () => nodes.get("expValidationMap").buttons.find(button => button.dataset.targetPoint === point) } });
+const setJudgement = async (id, checked = true) => { nodes.get(id).checked = checked; await fire(id, "change"); };
+api.render(studyState);
+assert.match(nodes.get("experimentWorkspace").innerHTML, /③ 实机验证/);
+assert.match(nodes.get("expValidationAxes").textContent, /原点左下 P01.*x \/ u → 右/);
+assert.match(nodes.get("experimentWorkspace").innerHTML, /保存时未勾选就表示不正确/);
+assert.equal(nodes.has("expValidationFreeze"), false, "No separate capture button is required to observe recognition");
+assert.equal(nodes.has("expActualPoint"), false, "The clickable target ring replaces a second actual-point selector");
+assert.ok(!nodes.get("experimentWorkspace").innerHTML.includes("冻结"), "Internal capture terminology does not appear in the operator UI");
+const visualTestIDs = nodes.get("expValidationMap").buttons.map(button => button.dataset.targetPoint);
+assert.equal(visualTestIDs.length, 25);
+assert.deepEqual(visualTestIDs.slice(0, 5), ["P21", "P22", "P23", "P24", "P25"]);
+assert.deepEqual(visualTestIDs.slice(-5), ["P01", "P02", "P03", "P04", "P05"]);
+assert.equal((nodes.get("expValidationMap").innerHTML.match(/is-predicted/g) || []).length, 1);
+assert.equal(nodes.get("expValidationMap").innerHTML.includes("is-target"), false, "Target is never preconfirmed");
+assert.match(nodes.get("expValidationMap").innerHTML, /class="validation-point untrained"[^>]*data-target-point="P02"[^>]*未训练/);
+assert.equal(nodes.get("expValidationSave").disabled, true, "A target must be explicitly selected before saving a judgement");
+assert.match(nodes.get("expValidationStatsState").textContent, /尚未实机验证/);
+assert.ok(!nodes.get("expValidationStats").innerHTML.includes("0.0%"));
+const legacyModelDefinition = { point_grid: legacyGrid, finger_id: "历史样件", force_sign: -1 };
+const legacyModelJSON = JSON.stringify(legacyModelDefinition);
+api.render({ ...studyState, analysis: { ...studyAnalysis, model_definition: legacyModelDefinition } });
+assert.deepEqual(nodes.get("expValidationMap").buttons.map(button => button.dataset.targetPoint), legacyGrid.map(point => point.id), "Legacy model matrix keeps stored order, without adopting today's lower-left numbering");
+assert.match(nodes.get("expValidationAxes").textContent, /按模型保存顺序.*空间轴方向未核实/);
+assert.ok(!nodes.get("expValidationAxes").textContent.includes("y / v ↑"));
+assert.match(nodes.get("expValidationMap").innerHTML, /P01，已存行 1 列 1/);
+assert.equal(JSON.stringify(legacyModelDefinition), legacyModelJSON, "Legacy geometry is never rewritten during rendering");
+const legacyTargetRequests = calls.length;
+await selectTarget("P01");
+assert.equal(calls.length, legacyTargetRequests);
+assert.match(nodes.get("expValidationMap").innerHTML, /is-predicted"[^>]*data-prediction-point="P05"/, "A legacy target still does not drive the prediction lamp");
+api.render({ ...studyState, analysis: { ...studyAnalysis, model_definition: { finger_id: "历史无几何样件" } } });
+assert.deepEqual(nodes.get("expValidationMap").buttons.map(button => button.dataset.targetPoint), grid.map(point => point.id));
+assert.match(nodes.get("expValidationAxes").textContent, /几何和空间轴方向未核实.*排列不表示实际空间位置/);
+assert.match(nodes.get("expValidationMap").innerHTML, /P01，历史几何未核实/);
+assert.ok(!nodes.get("expValidationMap").innerHTML.includes("行 null"));
+api.render(studyState);
+assert.deepEqual(nodes.get("expValidationMap").buttons.slice(0, 5).map(button => button.dataset.targetPoint), ["P21", "P22", "P23", "P24", "P25"]);
+assert.match(nodes.get("expValidationAxes").textContent, /原点左下 P01.*x \/ u → 右/);
+
+const beforeTarget = calls.length;
+await selectTarget("P01");
+assert.equal(calls.length, beforeTarget, "Target clicks are local labels, with no inference or capture request");
+assert.match(nodes.get("expValidationMap").innerHTML, /is-target"[^>]*data-target-point="P01"/);
+assert.match(nodes.get("expValidationMap").innerHTML, /is-predicted"[^>]*data-prediction-point="P05"/);
+assert.match(nodes.get("expTargetComparison").textContent, /目标 P01.*识别 P05.*位置不一致/);
+assert.equal(nodes.get("expPositionCorrect").disabled, true);
+assert.equal(nodes.get("expForceCorrect").disabled, false);
+await selectTarget("P05");
+assert.equal(calls.length, beforeTarget);
+assert.match(nodes.get("expTargetComparison").textContent, /位置一致/);
+assert.equal(nodes.get("expPositionCorrect").disabled, false);
+const beforeFirstCheck = calls.length;
+await setJudgement("expPositionCorrect");
+assert.deepEqual(calls.slice(beforeFirstCheck).map(call => call.path), ["/api/validation/freeze"]);
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { actual_point_id: "P05" }, "Target is capture metadata only, never input to inference");
+assert.equal(nodes.get("expJudgementTarget").textContent, "P05");
+assert.equal(nodes.get("expFrozenPoint").textContent, "P05");
+assert.equal(nodes.get("expFrozenForce").textContent, "1.200");
+assert.equal(nodes.get("expPositionCorrect").checked, true, "Only the operator's first explicit check is retained");
+assert.equal(nodes.get("expForceCorrect").checked, false);
+assert.ok(nodes.get("expValidationMap").buttons.every(button => button.disabled));
+assert.equal(nodes.get("expValidationSave").disabled, false);
+const currentLive = { ...studyAnalysis, prediction: { ...studyAnalysis.prediction, point_id: "P21", force_N: 2.8, truth_force_N: 2, error_N: .8 } };
+api.render({ ...studyState, analysis: currentLive, validation: validationBackend });
+assert.equal(nodes.get("expPredictionPoint").textContent, "P21");
+assert.match(nodes.get("expValidationMap").innerHTML, /is-predicted"[^>]*data-prediction-point="P21"/);
+assert.match(nodes.get("expValidationMap").innerHTML, /is-target"[^>]*data-target-point="P05"/);
+assert.equal(nodes.get("expFrozenPoint").textContent, "P05", "New live frames cannot replace the pending judgement");
+assert.equal(nodes.get("expFrozenForce").textContent, "1.200");
+await selectTarget("P01");
+assert.equal(nodes.get("expJudgementTarget").textContent, "P05", "Pending target cannot change silently");
+const beforeSecondCheck = calls.length;
+await setJudgement("expForceCorrect");
+assert.equal(calls.length, beforeSecondCheck, "The second check reuses the same server evidence");
+assert.equal(nodes.get("expForceCorrect").checked, true, "Judgement uses fixed .2 N error rather than the newer .8 N error");
+await fire("expValidationSave");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { sample_id: "V-test-1", position_correct: true, force_correct: true, actual_point_id: "P05" });
+assert.equal(validationBackend.stats.judged_total, 1);
+assert.equal(validationBackend.stats.position_correct, 1);
+assert.equal(validationBackend.stats.force_correct, 1);
+assert.equal(nodes.get("expPositionCorrect").checked, false);
+assert.equal(nodes.get("expForceCorrect").checked, false, "Saved checks cannot become the next press's preselected judgement");
+
+// A new target clears only the local completed summary, never recorded evidence.
+api.render({ ...studyState, validation: validationBackend, analysis: { ...studyAnalysis, prediction: { ...studyAnalysis.prediction, point_id: "P01", force_N: 1.7, error_N: .7 } } });
+await selectTarget("P01");
+assert.equal(nodes.get("expFrozenPoint").textContent, "—");
+nextFreezeSample = { ...sampleFixture, sample_id: "V-test-2", prediction: { ...sampleFixture.prediction, point_id: "P01", force_N: 1.7, error_N: .7 } };
+assert.equal(nodes.get("expForceCorrect").disabled, true);
+await setJudgement("expPositionCorrect");
+assert.match(nodes.get("expJudgementNote").textContent, /超过 0.3 N/);
+nodes.get("expForceCorrect").checked = true;
+const beforeContradiction = calls.filter(call => call.path === "/api/validation/judge").length;
+await fire("expValidationSave");
+assert.equal(calls.filter(call => call.path === "/api/validation/judge").length, beforeContradiction);
+assert.equal(nodes.get("expForceCorrect").checked, false);
+assert.match(nodes.get("expMessage").textContent, /超过 0.3 N/);
+clock += 1501; intervals[0]();
+assert.ok(!nodes.get("expValidationMap").innerHTML.includes("is-predicted"));
+assert.equal(nodes.get("expFrozenForce").textContent, "1.700");
+assert.equal(nodes.get("expValidationSave").disabled, false, "A historical pending judgement can still be saved after live data expires");
+await fire("expValidationSave");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { sample_id: "V-test-2", position_correct: true, force_correct: false, actual_point_id: "P01" });
+assert.equal(validationBackend.stats.judged_total, 2);
+
+// Failed inference remains in the true success-rate denominator.
+nextFreezeSample = rejectedSample;
+api.render({ ...studyState, validation: validationBackend, analysis: { ...studyAnalysis, prediction: { ...rejectedSample.prediction, comparison_ready: true } } });
+await selectTarget("P02");
+assert.match(nodes.get("expValidationMapState").textContent, /目标未训练/);
+assert.ok(!nodes.get("expValidationMap").innerHTML.includes("is-predicted"));
+assert.equal(nodes.get("expPositionCorrect").disabled, true);
+assert.equal(nodes.get("expForceCorrect").disabled, true);
+assert.equal(nodes.get("expValidationSave").disabled, false);
+const beforeFalseSave = calls.length;
+await fire("expValidationSave");
+assert.deepEqual(calls.slice(beforeFalseSave).map(call => call.path), ["/api/validation/freeze", "/api/validation/judge"], "Both unchecked can capture and save a failed press directly");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { sample_id: "V-test-rejected", position_correct: false, force_correct: false, actual_point_id: "P02" });
+assert.equal(nodes.get("expFrozenForce").textContent, "—");
+assert.equal(nodes.get("expFrozenTruth").textContent, "1.000");
+assert.equal(validationBackend.stats.judged_total, 3);
+assert.equal(validationBackend.stats.position_correct, 2);
+assert.equal(validationBackend.stats.force_correct, 1);
+assert.match(nodes.get("expValidationStats").innerHTML, /2 \/ 3 · 66.7%/);
+
+// A first-check race uses the server result, never optimistic live values.
+nextFreezeSample = { ...rejectedSample, sample_id: "V-test-race" };
+api.render({ ...studyState, validation: validationBackend });
+await selectTarget("P05");
+await setJudgement("expPositionCorrect");
+assert.equal(nodes.get("expPositionCorrect").checked, false);
+assert.equal(nodes.get("expForceCorrect").checked, false);
+assert.match(nodes.get("expFrozenStatus").textContent, /未输出有效预测/);
+assert.equal(nodes.get("expValidationSave").disabled, false);
+const discardedBefore = validationBackend.stats.judged_total;
+await fire("expValidationDiscard");
+assert.equal(calls.at(-1).path, "/api/validation/discard");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { sample_id: "V-test-race" });
+assert.equal(validationBackend.stats.judged_total, discardedBefore);
+assert.equal(nodes.get("expFrozenPoint").textContent, "—");
+assert.ok(nodes.get("expValidationMap").buttons.every(button => !button.disabled));
+
+// If inference moves between a displayed frame and the first check, the
+// captured server point must still match the immutable chosen target.
+nextFreezeSample = { ...sampleFixture, sample_id: "V-test-target-race", prediction: { ...sampleFixture.prediction, point_id: "P01" } };
+api.render({ ...studyState, validation: validationBackend });
+await selectTarget("P05");
+await setJudgement("expPositionCorrect");
+assert.equal(nodes.get("expJudgementTarget").textContent, "P05");
+assert.equal(nodes.get("expFrozenPoint").textContent, "P01");
+assert.equal(nodes.get("expPositionCorrect").checked, false);
+assert.equal(nodes.get("expPositionCorrect").disabled, true);
+assert.match(nodes.get("expMessage").textContent, /目标与识别点不同/);
+nodes.get("expPositionCorrect").checked = true;
+const beforeWrongTargetJudge = calls.length;
+await fire("expValidationSave");
+assert.equal(calls.length, beforeWrongTargetJudge, "Forced save cannot contradict the target fixed in server evidence");
+assert.equal(nodes.get("expPositionCorrect").checked, false);
+await fire("expValidationDiscard");
+assert.equal(validationBackend.stats.judged_total, 3);
+
+// Either manual check can be the first explicit judgement action.
+nextFreezeSample = { ...sampleFixture, sample_id: "V-test-force-first" };
+api.render({ ...studyState, validation: validationBackend });
+await selectTarget("P01");
+assert.equal(nodes.get("expPositionCorrect").disabled, true);
+assert.equal(nodes.get("expForceCorrect").disabled, false);
+const forceFirstCalls = calls.length;
+await setJudgement("expForceCorrect");
+assert.deepEqual(calls.slice(forceFirstCalls).map(call => call.path), ["/api/validation/freeze"]);
+assert.equal(nodes.get("expPositionCorrect").checked, false);
+assert.equal(nodes.get("expForceCorrect").checked, true);
+assert.equal(nodes.get("expJudgementTarget").textContent, "P01");
+assert.equal(nodes.get("expFrozenPoint").textContent, "P05");
+await fire("expValidationDiscard");
+assert.equal(nodes.get("expForceCorrect").checked, false);
+assert.equal(validationBackend.stats.judged_total, 3);
+
+nextFreezeSample = { ...sampleFixture, sample_id: "V-test-restore", prediction: { ...sampleFixture.prediction, point_id: "P25" } };
+api.render({ ...studyState, validation: validationBackend, analysis: { ...studyAnalysis, prediction: { ...studyAnalysis.prediction, point_id: "P25" } } });
+await selectTarget("P25");
+await setJudgement("expPositionCorrect");
+const restoredPending = JSON.parse(JSON.stringify(validationBackend.pending_sample));
+api.render({ ...studyState, analysis: { ...studyAnalysis, model_id: "other-model", model_sha256: "other-hash" }, validation: { pending_sample: null, stats: {} } });
+assert.equal(nodes.get("expFrozenPoint").textContent, "—");
+assert.equal(nodes.get("expValidationMap").innerHTML.includes("is-target"), false);
+api.render({ ...studyState, validation: { ...validationBackend, pending_sample: restoredPending } });
+assert.equal(nodes.get("expJudgementTarget").textContent, "P25", "Restored pending targets come from persisted evidence");
+assert.equal(nodes.get("expPositionCorrect").checked, false);
+assert.equal(nodes.get("expForceCorrect").checked, false);
+api.render(null);
+assert.equal(nodes.get("expFrozenPoint").textContent, "P25");
+assert.equal(nodes.get("expValidationSave").disabled, false);
+assert.ok(!nodes.get("expValidationMap").innerHTML.includes("is-predicted"));
+await fire("expValidationDiscard");
+assert.equal(validationBackend.stats.judged_total, 3);
+
+// Historical pending records without a stored target must not borrow today's click.
+const unknownTargetSample = { ...sampleFixture, sample_id: "V-test-old-target" };
+validationBackend = { ...validationBackend, pending_sample: unknownTargetSample, stats: { ...validationBackend.stats, pending_count: 1 } };
+api.render({ ...studyState, validation: validationBackend });
+assert.equal(nodes.get("expJudgementTarget").textContent, "未记录");
+assert.ok(!nodes.get("expValidationMap").innerHTML.includes("is-target"), "An old pending record cannot borrow the last local target ring");
+assert.match(nodes.get("expFrozenStatus").textContent, /没有目标记录.*重新判断/);
+assert.equal(nodes.get("expValidationSave").disabled, true);
+assert.equal(nodes.get("expValidationDiscard").disabled, false);
+await fire("expValidationDiscard");
+
+for (const invalid of [
+  { ...studyAnalysis, prediction: { ...studyAnalysis.prediction, comparison_ready: false } },
+  { ...studyAnalysis, model_id: null },
+  { ...studyAnalysis, test_reference: { ready: false } },
+  { ...studyAnalysis, prediction: { status: "无接触", force_N: 0, truth_force_N: 0 } },
+  { ...studyAnalysis, prediction: { ...studyAnalysis.prediction, truth_force_N: null } }
+]) {
+  api.render({ ...studyState, validation: validationBackend, analysis: invalid });
+  await selectTarget("P05");
+  assert.equal(nodes.get("expValidationSave").disabled, true);
+  const previousRequests = calls.length;
+  await fire("expValidationSave");
+  assert.equal(calls.length, previousRequests, "No model/reference/contact/synchronization means no capture or judgement request");
+}
+api.render({ ...studyState, validation: validationBackend });
+await selectTarget("P05");
+clock += 1501; intervals[0]();
+const staleCaptureRequests = calls.length;
+await fire("expValidationSave");
+assert.equal(calls.length, staleCaptureRequests, "Stale live data cannot start a new judgement");
+assert.equal(nodes.get("expValidationSave").disabled, true);
+api.render({ ...studyState, validation: validationBackend });
+nodes.get("expModelSelect").value = "P-study";
+nodes.get("expTestUnloaded").checked = true;
+await fire("expLoadModelBtn");
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), { model_id: "P-study" }, "The target label is never supplied when loading a model");
+assert.equal(nodes.get("expTestUnloaded").checked, false);
+assert.ok(!nodes.get("expValidationMap").innerHTML.includes("is-predicted"));
+assert.equal(nodes.get("expValidationSave").disabled, true);
+assert.match(nodes.get("expPredictionState").textContent, /等待本次无接触参考/);
+
+// End-of-round results use actual saved judgements, not cumulative history.
+const roundStats = { judged_total: 3, position_correct: 2, force_correct: 1, pending_count: 0, invalid_count: 0, inference_rejected: 1, force_error_count: 2, mae_N: .15, rmse_N: .2 };
+validationBackend = { ...validationBackend, validation_session_id: "validation-round-test", finished: false, session_stats: roundStats, stats: { ...roundStats, judged_total: 99, position_correct: 99, force_correct: 99, mae_N: 0, rmse_N: 0 } };
+api.render({ ...studyState, validation: validationBackend });
+assert.equal(nodes.get("expValidationFinish").disabled, false);
+assert.match(nodes.get("expValidationStatsState").textContent, /本轮已保存 3 次/);
+assert.match(nodes.get("expValidationStats").innerHTML, /2 \/ 3 · 66.7%/);
+assert.match(nodes.get("expValidationStats").innerHTML, /1 \/ 3 · 33.3%/);
+assert.match(nodes.get("expValidationStats").innerHTML, /MAE \/ N.*0.150/);
+assert.match(nodes.get("expValidationStats").innerHTML, /RMSE \/ N.*0.200/);
+assert.match(nodes.get("expValidationStats").innerHTML, /模型拒识 \/ 已判定.*1 \/ 3/);
+assert.ok(!nodes.get("expValidationStats").innerHTML.includes("99 / 99"));
+const beforeFinish = calls.length;
+await fire("expValidationFinish");
+assert.deepEqual(calls.slice(beforeFinish).map(call => call.path), ["/api/validation/finish"]);
+assert.deepEqual(JSON.parse(calls.at(-1).options.body), {});
+assert.match(nodes.get("expValidationStatsState").textContent, /本轮验证已结束：3 次/);
+assert.match(nodes.get("expValidationReportState").textContent, /本轮报告已保存.*2026-10-10 19:30.*测试夹具\/实机结果.json/);
+assert.equal(nodes.get("expValidationFinish").textContent, "查看已保存结果");
+api.render({ ...studyState, validation: JSON.parse(JSON.stringify(validationBackend)) });
+assert.match(nodes.get("expValidationReportState").textContent, /本轮报告已保存/);
+assert.match(nodes.get("expValidationStats").innerHTML, /0.150/);
+await fire("expValidationFinish");
+assert.equal(finishedReport.report_id, "R-validation-test", "Repeated finish restores the same persistent report");
+const emptyRound = { ...roundStats, judged_total: 0, position_correct: 0, force_correct: 0, force_error_count: 0, inference_rejected: 0, mae_N: null, rmse_N: null };
+api.render({ ...studyState, validation: { ...validationBackend, finished: false, validation_session_id: "next-real-round", session_stats: emptyRound } });
+assert.match(nodes.get("expValidationStatsState").textContent, /尚未实机验证/);
+assert.ok(!nodes.get("expValidationStats").innerHTML.includes("100.0%"));
+assert.ok(!nodes.get("expValidationStats").innerHTML.includes("0.150"));
+assert.equal(nodes.get("expValidationFinish").disabled, true);
+assert.match(nodes.get("expValidationReportState").textContent, /上次完成的验证报告.*上方为当前轮次统计/);
+const beforeEmptyFinish = calls.length;
+await fire("expValidationFinish");
+assert.equal(calls.length, beforeEmptyFinish, "An empty round cannot fabricate a saved result");
+const reportPending = { ...sampleFixture, sample_id: "V-test-finish-pending", target_point_id: "P05", actual_point_id: "P05" };
+api.render({ ...studyState, validation: { ...validationBackend, finished: false, pending_sample: reportPending, session_stats: { ...roundStats, pending_count: 1 } } });
+assert.equal(nodes.get("expValidationFinish").disabled, true);
+const beforePendingFinish = calls.length;
+await fire("expValidationFinish");
+assert.equal(calls.length, beforePendingFinish, "Unsaved manual judgement must be resolved before finishing");
+assert.match(nodes.get("expMessage").textContent, /请先保存本次判断/);
+await fire("expValidationDiscard");
+
+// The new static frontend may be served by a still-running 0.3.1 process.
+// Neither an enabled-looking old payload nor forced callbacks may send new
+// guided/trial/analysis mutations to it. Only an explicit stop may preserve it.
+const compatibilityCalls=calls.length;
+api.render({...state,version:"0.3.1"});
+assert.equal(nodes.get("expCompatibilityNotice").hidden,false);
+assert.match(nodes.get("expCompatibilityNotice").textContent,/旧版服务仍在运行，请先停止并保存会话，再关闭程序重新打开/);
+assert.match(nodes.get("expGuidedMessage").textContent,/当前服务 0\.3\.1.*界面要求 0\.7\.1/);
+for(const id of ["expStartBtn","expConfirmPointBtn","expBaselineBtn","expTrialStart","expTrialAbort","expTestReferenceBtn","expTrainingStart","expValidationFinish","expValidationSave","expValidationDiscard","expDeleteSessions","expRestoreSessions","expHistoryConfirm"]) assert.equal(nodes.get(id).disabled,true,id+" is blocked for an old service");
+assert.equal(nodes.get("expStopBtn").disabled,false);
+nodes.get("expDirectionConfirmed").checked=nodes.get("expCoordinatesConfirmed").checked=true;
+nodes.get("expRepetitions").value="3";
+for(const id of ["expStartBtn","expConfirmPointBtn","expTrialStart","expTrialAbort","expTrainingStart","expValidationSave","expValidationDiscard","expDeleteSessions","expRestoreSessions","expHistoryConfirm"]) await fire(id);
+assert.equal(calls.length,compatibilityCalls,"Programmatic invocation cannot bypass the request-level version guard");
+await fire("expStopBtn");
+assert.equal(calls.filter(call=>call.options.method==="POST").at(-1).path,"/api/experiment/stop");
+api.render({...state,version:"0.3.1",experiment:{},recording:true,session:{closed:false,path:"preserved-old-raw"}});
+assert.equal(nodes.get("expStopBtn").disabled,false);
+assert.equal(nodes.get("expStartBtn").disabled,true);
+const rawStopCalls=calls.length;
+await fire("expStopBtn");
+assert.deepEqual(calls.slice(rawStopCalls).map(call=>call.path),["/api/disconnect"],"Old raw recording only stops through its existing controlled drain-and-save API");
+assert.match(nodes.get("expMessage").textContent,/旧版原始采集已受控停止并保存/);
+assert.ok(calls.slice(compatibilityCalls).filter(call=>call.options.method==="POST").every(call=>["/api/experiment/stop","/api/disconnect"].includes(call.path)),"No old manual-trial fallback is sent");
+api.render({...state,version:"0.7.1",experiment:{}});
+assert.equal(nodes.get("expCompatibilityNotice").hidden,true);
+assert.equal(nodes.get("expStartBtn").disabled,false,"An explicitly reported matching service restores the new workflow");
+assert.ok(calls.every(call => !["/api/analysis/preview", "/api/analysis/pilot", "/api/analysis/build", "/api/analysis/report", "/api/analysis/evaluate"].includes(call.path)), "Retired analysis controls have no runtime API dependency");
+assert.ok(calls.every(call => call.path !== "/api/experiment/sessions"), "Active history uses the unified history API");
+assert.ok(calls.every(call => !call.path.includes("force/connect") && !call.path.includes("api/connect")), "Experiment UI never auto-connects instruments");
+console.log("实验工作区验证通过：0.7.1仅移除退休人工异常入口；保留全部历史与多选训练、可恢复删除/恢复门禁、真实训练进度、采集状态与无载标定保护、目标圈与识别灯独立、双false失败判断、0.3N/目标矛盾保护、当前轮次统计与结果持久恢复。仅仿真API测试，无硬件或真实文件操作。");

@@ -1,0 +1,9 @@
+{
+  "product_name": "9FBG",
+  "version": "0.7.1",
+  "delivery_status": "source-development",
+  "hardware_acceptance": "unloaded_verified_press_pending",
+  "formal_training": "blocked_until_real_unloaded_and_press_comparison",
+  "focus": "compact_side_by_side_point_selection_and_guided_acquisition",
+  "default_gui_recording": false
+}

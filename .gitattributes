@@ -1,0 +1,3 @@
+# Preserve the exact bytes used by the SDK/calibration provenance checks.
+# Keep each file's existing line endings on Windows and other platforms.
+* -text

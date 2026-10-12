@@ -1,0 +1,93 @@
+{
+  "product": "9FBG",
+  "version": "0.4.2",
+  "schema": "9fbg_sdk_provenance_v1",
+  "files": [
+    {
+      "path": "BaySpecSdkStream.cs",
+      "sha256": "dc45f99e7661df07983f25c81899ec62de5b3f5eed074425256f84aae55cb9a6",
+      "bytes": 34311,
+      "source_path": "C:\\光纤触觉\\TOUCH-System-Optical-Intensity-main\\research_beta\\touch_mfbg_intensity_research_beta\\sdk_probe\\BaySpecSdkStream.cs",
+      "source_sha256": "050061eabc3fb494f8832a3ce1ad0c31c4559d14a8a8a502a3e0579ecdf1deb7",
+      "modified": true,
+      "note": "Independent x86 helper: controlled stop, snapshot attempt timestamps and explicit high-resolution cadence timer; device SDK protocol unchanged",
+      "previous_revision_sha256": "485a72069c7abcb2dcad4d8cbba42b2374d06e5c5269bbc9f9e56478f931b77e",
+      "previous_revision_backup": "evidence/source-before-0.4.2/9FBG/assets/sdk/BaySpecSdkStream.cs"
+    },
+    {
+      "path": "BaySpecSdkStream.exe",
+      "sha256": "87a28177787fcc1f424c7f16e3ba1cc7fc82f884722569f26fa5ca74d5f72637",
+      "bytes": 23552,
+      "source_path": "C:\\光纤触觉\\TOUCH-System-Optical-Intensity-main\\research_beta\\touch_mfbg_intensity_research_beta\\sdk_probe\\BaySpecSdkStream.exe",
+      "source_sha256": "5a8e9be03ed795a7a9642faf8486c46caacb4ee4d72c92823778dc8a5298e77a",
+      "modified": true,
+      "note": "Independent x86 helper: controlled stop, snapshot attempt timestamps and explicit high-resolution cadence timer; device SDK protocol unchanged",
+      "previous_revision_sha256": "a61228ce1f566e805ac122094f9ad7a55cc29dbbfc6d2bae9e4fb3d50b0174bc",
+      "previous_revision_backup": "evidence/source-before-0.4.2/9FBG/assets/sdk/BaySpecSdkStream.exe"
+    },
+    {
+      "path": "_USB20BSDevOpDLL.dll",
+      "sha256": "055347d8a28c764e3983462cd7a880503c3d343fc109508adaa53a19862358c3",
+      "bytes": 135168,
+      "source_path": "C:\\光纤触觉\\TOUCH-System-Optical-Intensity-main\\research_beta\\touch_mfbg_intensity_research_beta\\sdk_probe\\_USB20BSDevOpDLL.dll",
+      "source_sha256": "055347d8a28c764e3983462cd7a880503c3d343fc109508adaa53a19862358c3",
+      "modified": false,
+      "note": "Vendor/calibration original or read-only rendered audit page"
+    },
+    {
+      "path": "wavelength_axis_F1520808_512.json",
+      "sha256": "2929887724b03b38eb7e825e21516ad8c52537e28acfa126c3a548de34599e95",
+      "bytes": 9514,
+      "source_path": "C:\\光纤触觉\\TOUCH-System-Optical-Intensity-main\\research_beta\\touch_mfbg_intensity_research_beta\\sdk_probe\\wavelength_axis_F1520808_512.json",
+      "source_sha256": "2929887724b03b38eb7e825e21516ad8c52537e28acfa126c3a548de34599e95",
+      "modified": false,
+      "note": "Vendor/calibration original or read-only rendered audit page"
+    },
+    {
+      "path": "Spectrum_F1520808_20260923143815.csv",
+      "sha256": "13ee194dbc1a91626d3cd150dfb3820307ee267b911582ade2a28c74b3ed5a8f",
+      "bytes": 10886,
+      "source_path": "C:/光纤触觉/BaySpec_Sense_Migration_20260921/BaySpec_Sense_Migration_20260921/Sense_2020_V1.6.3.3/Spectrum_Data/Spectrum_F1520808_20260923143815.csv",
+      "source_sha256": "13ee194dbc1a91626d3cd150dfb3820307ee267b911582ade2a28c74b3ed5a8f",
+      "modified": false,
+      "note": "Vendor/calibration original or read-only rendered audit page"
+    },
+    {
+      "path": "build_x86.cmd",
+      "sha256": "d8020f424c3b5261bee97619ebc3caf30b311f5dbc9b50369c6c896b1c8df010",
+      "bytes": 395,
+      "source_path": "C:\\光纤触觉\\TOUCH-System-Optical-Intensity-main\\research_beta\\touch_mfbg_intensity_research_beta\\sdk_probe\\build_x86.cmd",
+      "source_sha256": "d8020f424c3b5261bee97619ebc3caf30b311f5dbc9b50369c6c896b1c8df010",
+      "modified": false,
+      "note": "Vendor/calibration original or read-only rendered audit page"
+    },
+    {
+      "path": "vendor_protocol/page-10.png",
+      "sha256": "43bae3bbcf019a948dfca4fd1d877f57b35e84f3c149fc05a5f3d20634b30358",
+      "bytes": 107190,
+      "source_path": "C:/光纤触觉/PX6D六维力传感器产品资料包/【X01】说明书/六维力传感器说明书.pdf",
+      "source_sha256": "febbeb82cf871a52849d0f3ce2f0e66e92ddc7f7b43b9ae33181eefbfb890f95",
+      "modified": false,
+      "note": "Vendor/calibration original or read-only rendered audit page"
+    },
+    {
+      "path": "vendor_protocol/page-11.png",
+      "sha256": "5ad8e3f1237dc3b63a00944590e21026b7b267e2cedf980c6c8ecf2ad3e269d8",
+      "bytes": 91814,
+      "source_path": "C:/光纤触觉/PX6D六维力传感器产品资料包/【X01】说明书/六维力传感器说明书.pdf",
+      "source_sha256": "febbeb82cf871a52849d0f3ce2f0e66e92ddc7f7b43b9ae33181eefbfb890f95",
+      "modified": false,
+      "note": "Vendor/calibration original or read-only rendered audit page"
+    },
+    {
+      "path": "vendor_protocol/page-12.png",
+      "sha256": "2bdb08e235aff2f76169b99bfc4d34503a4a8d09f477e813eff93f6dbe46130a",
+      "bytes": 128370,
+      "source_path": "C:/光纤触觉/PX6D六维力传感器产品资料包/【X01】说明书/六维力传感器说明书.pdf",
+      "source_sha256": "febbeb82cf871a52849d0f3ce2f0e66e92ddc7f7b43b9ae33181eefbfb890f95",
+      "modified": false,
+      "note": "Vendor/calibration original or read-only rendered audit page"
+    }
+  ],
+  "updated_utc": "2026-10-10T06:57:57.983942+00:00"
+}

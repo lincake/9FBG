@@ -1,0 +1,32 @@
+.venv/
+userdata/
+evidence/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Local environments, credentials, logs and generated output
+venv/
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+*.lnk
+.coverage
+htmlcov/
+build/
+dist/
+.DS_Store
+Thumbs.db
+
+# Keep only the protocol pages referenced by SDK_PROVENANCE.json
+assets/sdk/vendor_protocol/*
+!assets/sdk/vendor_protocol/page-10.png
+!assets/sdk/vendor_protocol/page-11.png
+!assets/sdk/vendor_protocol/page-12.png
+
+# Historical maintenance tools tied to this machine's retired TOUCH files
+tools/retire_touch.py
+tools/summarize_acceptance.py

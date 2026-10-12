@@ -1,0 +1,26 @@
+{
+  "schema": "9fbg_device_config_v1",
+  "version": "0.1.0",
+  "auto_start": false,
+  "bayspec": {
+    "helper": "assets/sdk/BaySpecSdkStream.exe",
+    "axis": "assets/sdk/wavelength_axis_F1520808_512.json",
+    "axis_artifact_device_id": "F1520808",
+    "integration_us": 20,
+    "sensor_mode": 1,
+    "interval_ms": 40,
+    "trigger_hz": 100,
+    "queue_limit": 128,
+    "legacy_ports": [8660, 8765]
+  },
+  "px6d": {
+    "usb_vid": 10473,
+    "usb_pid": 394,
+    "usb_serial_number": "D2F56A779C93",
+    "baud_rate": 921600,
+    "device_id": 127,
+    "poll_hz": 50,
+    "read_timeout_sec": 0.2,
+    "legacy_ports": [8660, 8765]
+  }
+}
