@@ -134,6 +134,7 @@ def test_force_failure_can_reconnect_without_stopping_optical(tmp_path, fake_har
         until(lambda: service.force_worker is not None and not service.force_worker.is_alive())
         assert service.force_error == "测试六轴超时"
         assert not service.stop_event.is_set()
+        assert service.snapshot()["stopped"] is False
         assert optical[0].connected
         assert service.snapshot()["sync"]["valid"] is False
         Force.fail = False
@@ -143,6 +144,39 @@ def test_force_failure_can_reconnect_without_stopping_optical(tmp_path, fake_har
         assert service.error is None
     finally:
         service.disconnect()
+
+
+def test_runtime_optical_failure_exposes_stop_without_discarding_reference_or_raw_frame(
+        tmp_path, fake_hardware, monkeypatch):
+    optical, _, _ = fake_hardware
+    service = AcquisitionService(Path(__file__).resolve().parents[1], tmp_path / "uncreated")
+    service.connect(record=False, connect_force=False, auto_reference=True,
+                    config={"stable_frames": 3})
+    try:
+        until(lambda: len(service.snapshot()["tracker"].get("reference_nm") or []) == 9)
+        reference = service.snapshot()["tracker"]["reference_nm"]
+
+        def fail_read():
+            raise TimeoutError("光谱设备超过 2 秒未返回新有效采集帧")
+
+        monkeypatch.setattr(optical[0], "read", fail_read)
+        until(lambda: service.stop_event.is_set() and not service.workers[0].is_alive())
+        state = service.snapshot()
+        assert state["stopped"] is True
+        assert state["running"] is True  # Controlled disconnect still owns the session.
+        assert "超过 2 秒" in state["error"]
+        assert state["tracker"]["reference_nm"] == reference
+        assert state["tracker"]["reference_version"] == 1
+        assert state["tracker"]["display_stale"] is True
+        assert state["tracker"]["peaks"]
+        assert all(not peak["valid"] and peak["stale"] for peak in state["tracker"]["peaks"])
+        assert len(state["frame"]["intensity"]) == 512
+        assert state["frame"]["intensity"] == optical[0].frame["intensity"]
+        assert not optical[0].connected
+        assert not service.userdata.exists()
+    finally:
+        service.disconnect()
+    assert service.snapshot()["running"] is False
 
 
 def test_force_connection_requires_active_hardware_and_options_validate_first(tmp_path):

@@ -1,9 +1,35 @@
 {
   "product_name": "9FBG",
-  "version": "0.7.1",
+  "version": "0.21.11",
   "delivery_status": "source-development",
   "hardware_acceptance": "unloaded_verified_press_pending",
   "formal_training": "blocked_until_real_unloaded_and_press_comparison",
-  "focus": "compact_side_by_side_point_selection_and_guided_acquisition",
-  "default_gui_recording": false
+  "focus": "show_saved_no_contact_round_count_in_selection_button",
+  "force_target_range_policy": "target_strictly_below_upper_v1",
+  "gui": "PyQt6",
+  "gui_runtime": "native_widgets_direct_python_service",
+  "startup": "manual_hardware_connection_no_http_no_browser",
+  "optical_connect_reference": "optical_connect_auto_v1",
+  "spectral_model": "research_only_physical_press_acceptance_pending",
+  "default_gui_recording": false,
+  "native_capture_setup_policy": "configured_geometry_v1",
+  "pulse_acceptance": "software_verified_human_pulse_comparison_pending",
+  "pulse_calibration": "10s_unloaded_noise_fbg5_center_prior",
+  "pulse_gap_policy": "segment_short_gaps_preserve_fixed_weights",
+  "pulse_center_fbg": "FBG5",
+  "pulse_center_position_source": "operator_confirmed_nearest_center_2026_10_16",
+  "pulse_stream": "continuous_after_noise_hand_on_off",
+  "pulse_gui_priority": "native_active_page_display_only_freeze",
+  "pulse_noise_policy": "effective-source-time-and-samples-v1",
+  "pulse_rate_gate": "20hz_for_periodic_candidate_only",
+  "pulse_filter_config": "pulse-bandpass-config-v1",
+  "pulse_filter_default_hz": [
+    0.7,
+    3
+  ],
+  "pulse_filter_input_bounds_hz": [
+    0.1,
+    8
+  ],
+  "pulse_filter_change": "explicit_apply_invalidates_noise_weights"
 }

@@ -103,6 +103,7 @@ def saved_events(fixture):
 def authorize_and_press(fixture, url, *, with_force=True):
     """Twelve distinct unloaded PX frames then the thirteenth comparison frame."""
     service, state, clock = fixture.service, fixture.state, fixture.clock
+    previous_begins = service.tracker.begins
     state["force_connected"] = with_force
     if not with_force:
         state["force"] = None
@@ -111,10 +112,10 @@ def authorize_and_press(fixture, url, *, with_force=True):
     requested = service.analysis.test_reference["requested_ns"]
     clock.now = requested+10_000_000
     tracker = state["tracker"]
-    tracker.update(reference_version=2, reference_pending=False, host_rx_monotonic_ns=clock.now)
+    tracker.update(reference_version=tracker["reference_version"]+1, reference_pending=False, host_rx_monotonic_ns=clock.now)
     with service.tracker_lock:
         service._freeze_independent_reference(tracker, {"stream_epoch": tracker["stream_epoch"], "host_rx_monotonic_ns": clock.now})
-    assert service.tracker.begins == 1 and tracker["reference_frozen"]
+    assert service.tracker.begins == previous_begins+1 and tracker["reference_frozen"]
     service.snapshot()
     assert service.analysis.test_reference["ready"]
     if with_force:
@@ -152,6 +153,7 @@ def test_http_load_and_thirteen_frame_live_prediction_do_not_use_operator_point_
     with http_service(fixture.service) as url:
         loaded = post(url, "/api/analysis/load", {"model_id": "Pfixture", "force_N": 999, "actual_point_id": "P25"})
         assert loaded["model_kind"] == "pilot"
+        assert loaded["analysis"]["inference_active"] is True
         before = fixture.service.snapshot()["analysis"]["prediction"]
         assert before["status"] == "无效" and before["force_N"] is None
         result = authorize_and_press(fixture, url)
@@ -501,3 +503,98 @@ def test_model_switch_isolates_saved_counts_and_reloading_requires_new_reference
         assert fixture.service.validation.snapshot()["stats"]["judged_total"] == 1
         assert fixture.service.snapshot()["analysis"]["prediction"]["status"] == "无效"
         post(url, "/api/validation/freeze", error="同步")
+
+
+def test_http_stop_protects_pending_judgment_preserves_report_and_training_and_requires_reload(live_api, monkeypatch):
+    fixture, service = live_api, live_api.service
+    with http_service(service) as url:
+        post(url, "/api/analysis/load", {"model_id": "Pfixture"})
+        authorize_and_press(fixture, url)
+        sample = post(url, "/api/validation/freeze", {"actual_point_id": "P01"})["sample"]
+        before = deepcopy(service.analysis.test_reference)
+        post(url, "/api/analysis/stop", error="先保存本次判断")
+        assert service.analysis.inference_active and service.analysis.test_reference == before
+        assert service.validation.snapshot()["pending_sample"]["sample_id"] == sample["sample_id"]
+        post(url, "/api/validation/judge", {"sample_id": sample["sample_id"],
+                                            "position_correct": True, "force_correct": True})
+        report = post(url, "/api/validation/finish")["report"]
+        assert service.analysis.inference_active, "Saving judgment statistics does not end inference"
+        report_bytes = Path(report["path"]).read_bytes()
+        records_before = saved_events(fixture)
+        service.analysis.busy = True
+        service.analysis.training.update(busy=True, status="running", method="linear")
+        training_before = deepcopy(service.analysis.training)
+        force_stop_before = service.force_stop_event.is_set()
+        from ninefbg.pilot import predict_pilot
+        monkeypatch.setattr("ninefbg.pilot.predict_pilot", lambda *args: pytest.fail("已结束推理仍运行了网络"))
+        stopped = post(url, "/api/analysis/stop")
+        analysis = stopped["analysis"]
+        assert not analysis["inference_active"] and analysis["model_id"] == "Pfixture"
+        assert analysis["prediction"]["status"] == "已结束"
+        assert analysis["prediction"]["point_id"] is analysis["prediction"]["force_N"] is None
+        assert analysis["prediction"]["wrench_pred"] is analysis["prediction"]["truth_force_N"] is None
+        assert not analysis["test_reference"]["ready"] and not analysis["test_reference"]["pending"]
+        assert not analysis["truth_zero"]["ready"] and not analysis["truth_zero"]["pending"]
+        assert analysis["busy"] and analysis["training"] == training_before
+        assert service.running and not service.stop_event.is_set()
+        assert service.force_stop_event.is_set() == force_stop_before and not service.test_reference_freeze
+        tracker_before = deepcopy(fixture.state["tracker"])
+        post(url, "/api/analysis/reference", {"unloaded_confirmed": True}, error="重新载入")
+        assert fixture.state["tracker"] == tracker_before
+        for _ in range(3):
+            fixture.state["tracker"]["frame_id"] += 1
+            with urllib.request.urlopen(url+"/api/state") as response:
+                assert not json.load(response)["analysis"]["inference_active"]
+        assert saved_events(fixture) == records_before
+        assert Path(report["path"]).read_bytes() == report_bytes
+        service.analysis.busy = False
+        service.analysis.training.update(busy=False, status="completed")
+        loaded = post(url, "/api/analysis/load", {"model_id": "Pfixture"})
+        assert loaded["analysis"]["inference_active"] and not loaded["analysis"]["test_reference"]["ready"]
+        monkeypatch.setattr("ninefbg.pilot.predict_pilot", predict_pilot)
+        assert authorize_and_press(fixture, url)["status"] == "有效估计"
+
+
+@pytest.mark.parametrize("condition", ["loaded", "reference_pending", "disconnected"])
+def test_http_stop_without_judgments_does_not_need_devices_or_ready_reference(live_api, condition):
+    fixture, service = live_api, live_api.service
+    with http_service(service) as url:
+        post(url, "/api/analysis/load", {"model_id": "Pfixture"})
+        if condition == "reference_pending":
+            post(url, "/api/analysis/reference", {"unloaded_confirmed": True})
+            assert service.analysis.test_reference["pending"]
+        elif condition == "disconnected":
+            service.running = False
+        post(url, "/api/analysis/stop", {"unexpected": True}, error="不接受额外字段")
+        assert service.analysis.inference_active
+        if condition == "loaded":
+            empty = urllib.request.Request(url+"/api/analysis/stop", data=b"",
+                                           headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(empty, timeout=10) as response:
+                result = json.load(response)
+        else:
+            result = post(url, "/api/analysis/stop")
+        assert not result["analysis"]["inference_active"]
+        assert result["validation"]["stats"]["judged_total"] == 0
+        assert result["analysis"]["model_id"] == "Pfixture"
+        assert not (fixture.archive["root"] / "validation_sessions").exists()
+
+
+def test_http_stop_refuses_active_acquisition_and_save_without_changing_reference(live_api, monkeypatch):
+    service = live_api.service
+    with http_service(service) as url:
+        post(url, "/api/analysis/load", {"model_id": "Pfixture"})
+        authorize_and_press(live_api, url)
+        baseline = {"ready": True, "force_zero": [1]*6, "reference_version": 2}
+        monkeypatch.setattr(service.experiment, "snapshot", lambda: {"running": True, "baseline": deepcopy(baseline)})
+        before = deepcopy(service.analysis.test_reference)
+        tracker_before = deepcopy(live_api.state["tracker"])
+        post(url, "/api/analysis/stop", error="先停止并保存采集会话")
+        assert service.analysis.inference_active and service.analysis.test_reference == before
+        assert live_api.state["tracker"] == tracker_before
+        assert service.experiment.snapshot()["baseline"] == baseline
+        monkeypatch.setattr(service.experiment, "snapshot", lambda: {"running": False})
+        service.stopping = True
+        post(url, "/api/analysis/stop", error="正在停止保存")
+        assert service.analysis.inference_active
+        service.stopping = False

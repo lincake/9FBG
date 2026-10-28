@@ -1,6 +1,8 @@
 import json
 from copy import deepcopy
 
+import pytest
+
 from ninefbg.experiment import default_point_grid, list_sessions
 
 
@@ -120,6 +122,36 @@ def test_saved_completeness_and_full_grid_progress_are_independent(tmp_path):
         assert row["acquisition_complete"] and not row["formal_training_qualified"]
     assert full["has_training_data"] and full["complete"]
     assert not incomplete["has_training_data"] and not incomplete["complete"]
+
+
+@pytest.mark.parametrize("repetitions", [1, 2, 999])
+def test_saved_repetition_range_is_respected_without_rewriting_history(tmp_path, repetitions):
+    settings = {"finger_id": "6", "guided_acquisition": True,
+                "repetitions_per_point": repetitions, "point_grid": default_point_grid()}
+    trials = [trial(number, point["id"]) for number, point in enumerate(default_point_grid(), 1)]
+    path = saved_manifest(tmp_path, settings=settings, trials=trials)
+    original = path.read_bytes()
+    summary, = list_sessions(tmp_path)
+    assert summary["repetitions_per_point"] == repetitions
+    assert summary["total_required"] == 25 * repetitions
+    assert summary["accepted_trial_count"] == summary["point_count"] == 25
+    assert summary["completed_point_count"] == (25 if repetitions == 1 else 0)
+    assert summary["acquisition_complete"] is (repetitions == 1)
+    assert summary["has_training_data"] and not summary["formal_training_qualified"]
+    assert summary["settings"] == settings and path.read_bytes() == original
+
+
+@pytest.mark.parametrize("repetitions", [None, 0, -1, 1000, True, 1.0, "1"])
+def test_invalid_saved_repetitions_keep_default_fallback(tmp_path, repetitions):
+    settings = {"guided_acquisition": True, "point_grid": default_point_grid()}
+    if repetitions is not None:
+        settings["repetitions_per_point"] = repetitions
+    path = saved_manifest(tmp_path, settings=settings, trials=[trial(1)])
+    original = path.read_bytes()
+    summary, = list_sessions(tmp_path)
+    assert summary["repetitions_per_point"] == 3 and summary["total_required"] == 75
+    assert summary["completed_point_count"] == 0 and not summary["acquisition_complete"]
+    assert path.read_bytes() == original
 
 
 def test_listing_skips_unfinished_and_invalid_manifest_without_creating_storage(tmp_path):

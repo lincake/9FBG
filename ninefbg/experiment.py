@@ -11,6 +11,12 @@ import threading
 import time
 
 from .storage import SessionWriter, clean
+from .capture_setup import SETUP_POLICY, setup_allows_trial
+from .timed_wrench import timed_settings
+from .force_target_wrench import ForceTargetWrenchMixin, force_target_settings
+from .no_contact import (NO_CONTACT_POINT_ID, NO_CONTACT_QUALITY_VERSION, CONTACT_LABEL_VERSION,
+                         is_no_contact_trial, validate_no_contact_trial)
+from .peak_drift_capture import compact, RECORDING_SCHEMA, CAPTURE_MODES
 
 IDS = tuple(f"FBG{i}" for i in range(1, 10))
 AXES = ("Fx", "Fy", "Fz", "Mx", "My", "Mz")
@@ -94,7 +100,7 @@ def _identity(frame):
     return epoch, value
 
 
-def _context(context, *, stable=False):
+def _context(context, *, stable=False, spectrum_only=False):
     tracker = context.get("tracker", context)
     frame, force = context.get("frame") or {}, context.get("force") or {}
     optical = next((item for item in context.get("devices", []) if item.get("wavelength_axis") or item.get("sdk_status_raw")), {})
@@ -103,9 +109,9 @@ def _context(context, *, stable=False):
     force_epoch = context.get("force_epoch", context.get("force_stream_epoch", force.get("stream_epoch")))
     if context.get("mode") != "hardware" or context.get("running") is not True or optical_connected is not True or context.get("force_connected") is not True:
         raise ValueError("实验需要实际设备的光谱与 PX6D 两路实时连接")
-    if not optical_epoch or not force_epoch or tracker.get("display_stale") is True or force.get("stale") is True or force.get("valid") is False:
+    if not optical_epoch or not force_epoch or (not spectrum_only and tracker.get("display_stale") is True) or force.get("stale") is True or force.get("valid") is False:
         raise ValueError("实验需要两路新鲜有效的采集时段，不能使用旧值")
-    if _finite(tracker.get("display_age_ms")) and tracker["display_age_ms"] > 1000 or _finite(force.get("age_ms")) and force["age_ms"] > 250:
+    if (not spectrum_only and _finite(tracker.get("display_age_ms")) and tracker["display_age_ms"] > 1000) or _finite(force.get("age_ms")) and force["age_ms"] > 250:
         raise ValueError("实验采集帧已过期")
     if stable and (_peaks(tracker) is None or tracker.get("reference_pending") is True):
         raise ValueError("请先取得稳定有效的 9 个固定编号光栅")
@@ -119,7 +125,24 @@ def _context(context, *, stable=False):
 
 def _settings(settings):
     value = deepcopy(settings)
-    # Optional for older API clients; the current operator form requires it.
+    if "setup_policy" in value and value["setup_policy"] != SETUP_POLICY:
+        raise ValueError("实验设置策略无效")
+    if "capture_mode" in value:
+        mode = value["capture_mode"]
+        if not isinstance(mode, str) or mode not in CAPTURE_MODES:
+            raise ValueError("采集模式必须为全谱或寻峰漂移")
+        required = "delta_lambda_9" if mode == "peak_drift" else "delta_S"
+        if "input_kind" in value and value["input_kind"] != required:
+            raise ValueError("采集模式与模型输入不一致：全谱使用 512 点，寻峰漂移使用九路")
+        value["input_kind"] = required
+    force_target_settings(value)
+    timed_settings(value)
+    if value.get("input_kind", "delta_S") not in {"delta_S", "delta_lambda_9"}:
+        raise ValueError("采集输入必须为全谱或九路波长漂移")
+    if value.get("input_kind") == "delta_lambda_9" and value.get("acquisition_protocol") != "force_target_wrench_v1":
+        raise ValueError("九路波长漂移采集使用合力目标与手动结束协议")
+    # Service startup supplies automatic IDs when the API omits data_id;
+    # explicit legacy API identifiers remain optional text here.
     # Keep this independent of the specimen ID and historical contact diameter.
     value.setdefault("data_id", "")
     if not isinstance(value["data_id"], str) or len(value["data_id"]) > 128:
@@ -141,10 +164,10 @@ def _settings(settings):
         raise ValueError("引导式采集开关必须为布尔值")
     value["guided_acquisition"] = value.get("guided_acquisition", False)
     repetitions = value.get("repetitions_per_point", 3)
-    if type(repetitions) is not int or not 3 <= repetitions <= 999:
-        raise ValueError("每点合格重复次数必须为 3～999 的整数")
+    if type(repetitions) is not int or not 1 <= repetitions <= 999:
+        raise ValueError("每点合格重复次数必须为 1～999 的整数")
     value["repetitions_per_point"] = repetitions
-    if value["guided_acquisition"]:
+    if value["guided_acquisition"] and value.get("acquisition_protocol") not in {"timed_wrench_v1", "force_target_wrench_v1"}:
         if value["max_force_N"] != 3:
             raise ValueError("引导式采集当前使用固定 3 N 目标")
         value["guided_criteria"] = deepcopy(GUIDED_CRITERIA)
@@ -189,7 +212,7 @@ def _settings(settings):
     return value
 
 
-class ExperimentManager:
+class ExperimentManager(ForceTargetWrenchMixin):
     def __init__(self, userdata):
         self.userdata = Path(userdata)
         self.lock = threading.RLock()
@@ -212,16 +235,26 @@ class ExperimentManager:
         self._baseline_number = self._trial_number = 0
         self._guided = {"enabled": False}
         self._guided_rounds = {}
+        self._timed = {"enabled": False}
 
     def start(self, settings, context):
         with self.lock:
             if self.running or self.writer and not self.writer.closed:
                 raise ValueError("请先结束当前实验会话")
-            checked, active = _settings(settings), _context(context, stable=True)
+            checked = _settings(settings)
+            timed = checked.get("acquisition_protocol") in {"timed_wrench_v1", "force_target_wrench_v1"}
+            active = _context(context, stable=not timed, spectrum_only=timed)
             self.settings, self.context = checked, active
             audit = {key: deepcopy(context.get(key)) for key in ("devices", "tracker", "tracker_config")}
             audit["optical_preprocessing"] = deepcopy((context.get("frame") or {}).get("preprocessing"))
-            self.writer = SessionWriter(self.userdata / "calibration_sessions", {"kind": "9fbg_calibration_experiment_v1", "settings": checked, "coordinate_definition": deepcopy(checked["coordinate_definition"]), "acquisition_context": active, "acquisition_audit": clean(audit), "formal_training_qualified": False})
+            metadata = {"kind": "9fbg_calibration_experiment_v1", "settings": checked,
+                        "coordinate_definition": deepcopy(checked["coordinate_definition"]),
+                        "acquisition_context": active, "acquisition_audit": clean(audit), "formal_training_qualified": False}
+            if compact(checked):
+                from .peak_drift_capture import static_axis
+                metadata.update(recording_schema=RECORDING_SCHEMA, capture_mode="peak_drift",
+                                static_wavelength_nm=static_axis(context))
+            self.writer = SessionWriter(self.userdata / "calibration_sessions", metadata)
             self.session_id = self.writer.metadata["session_id"]
             self.running, self.status, self.error = True, "recording", None
             enabled = checked["guided_acquisition"]
@@ -229,13 +262,24 @@ class ExperimentManager:
             self.baseline = {"status": "required", "ready": False}
             self.counts = {key: 0 for key in ("raw_spectra", "raw_force", "results", "events", "sync_valid", "sync_invalid", "trials_completed", "trials_aborted")}
             self._timeline, self._baselines, self._trials = [], {}, {}
+            self._drift_last_spectrum_ns = self._drift_result_watermark_ns = 0
+            self._drift_stop_cutoff_ns = None
+            self._drift_preload_frames = {}
+            self._drift_training_tail = {}
+            self._drift_contact_windows = {}
+            self._drift_no_contact_windows = {}
+            self._compact_drift_reference_attempted = set()
             self._force_records.clear()
             self._zero_samples, self._zero_seen = [], set()
             self._baseline_number = self._trial_number = 0
             self._guided = {"enabled": enabled, "step": "select_point", "last_quality": None, "force_N": 0, "preload": None,
                             "accepted_by_point": {point["id"]: 0 for point in checked["point_grid"]},
                             "attempts_by_point": {point["id"]: 0 for point in checked["point_grid"]}}
+            if checked.get("acquisition_protocol") == "force_target_wrench_v1":
+                self._guided["accepted_by_point"][NO_CONTACT_POINT_ID] = 0
+                self._guided["attempts_by_point"][NO_CONTACT_POINT_ID] = 0
             self._guided_rounds = {}
+            self._timed_reset(timed)
             self._transition("session_start")
             return self.snapshot()
 
@@ -244,12 +288,48 @@ class ExperimentManager:
             raise ValueError(self.error or "请先开始实验会话")
 
     def _submit(self, kind, row):
+        original_kind = kind
+        if compact(self.settings):
+            from .peak_drift_capture import optical_source, peak_row
+            if kind == "raw_spectra":
+                kind, row = "optical_sources", optical_source(row, row.get("experiment") or {})
+            elif kind == "results":
+                reference = self._trials.get(row.get("trial_id"), {}).get("drift_reference")
+                kind, row = "peak_frames", peak_row(row, reference)
         try:
             self.writer.submit(kind, row)
         except Exception as exc:
             self._fail(exc)
             raise
-        self.counts[kind] += 1
+        self.counts[kind] = self.counts.get(kind, 0)+1
+        if original_kind != kind:
+            self.counts[original_kind] = self.counts.get(original_kind, 0)+1
+
+    def _compact_freeze_drift_reference(self, annotation):
+        """FIFO fits finish preload before its first non-preload source result."""
+        trial_id = annotation.get("trial_id")
+        if (not compact(self.settings) or not trial_id or annotation.get("phase") == "preload"
+                or trial_id in self._compact_drift_reference_attempted
+                or annotation.get("phase") not in {"waiting_contact", "loading", "release", "no_contact", "recovery", "saving"}):
+            return
+        self._compact_drift_reference_attempted.add(trial_id)
+        trial = self._trials.get(trial_id, {})
+        state = self._timed.get("trial") or {}
+        effective = state.get("press_prompt_ns") if state.get("trial_id") == trial_id else None
+        effective = effective or trial.get("quality", {}).get("metrics", {}).get("press_prompt_monotonic_ns")
+        frames = [frame for frame in self._drift_preload_frames.get(trial_id, [])
+                  if type(effective) is int and frame["host_rx_monotonic_ns"] < effective]
+        try:
+            from .drift_features import make_drift_reference
+            from .peak_drift_capture import digest
+            reference = make_drift_reference(frames, effective_ns=effective,
+                reference_id="D0-"+trial_id+"-"+digest(frames)[:16], trigger="recorded_two_second_preload",
+                trial_id=trial_id, baseline_id=annotation.get("baseline_id"))
+        except (ValueError, TypeError):
+            return  # Final derived quality rejects missing/invalid references.
+        trial["drift_reference"] = reference
+        self._submit("events", {**annotation, "event": "nine_fbg_trial_reference_ready",
+                                "host_rx_monotonic_ns": effective, "drift_reference": reference})
 
     def _annotation(self, stamp):
         state = next((state for at, state in reversed(self._timeline) if stamp is not None and at <= stamp), None)
@@ -257,7 +337,107 @@ class ExperimentManager:
             return {"session_id": self.session_id, "trial_id": None, "point_id": None, "baseline_id": None, "phase": "pre_session", "eligible": False, "manual_mark": []}
         return deepcopy(state)
 
+    def source_annotation(self, stamp):
+        """A delayed fit retains the source-time trial and preload boundary."""
+        with self.lock:
+            value = self._annotation(stamp)
+            trial = self._trials.get(value.get("trial_id"), {})
+            state = self._timed.get("trial") or {}
+            prompt = state.get("press_prompt_ns") if state.get("trial_id") == value.get("trial_id") else None
+            value["press_prompt_monotonic_ns"] = prompt or trial.get("quality", {}).get("press_prompt_monotonic_ns")
+            return value
+
+    def begin_result_drain(self):
+        """Freeze a capture boundary while its already accepted fits finish."""
+        with self.lock:
+            self._drift_stop_cutoff_ns = time.perf_counter_ns()
+            return getattr(self, "_drift_last_spectrum_ns", 0)
+
+    def _drift_beyond_stop(self, frame):
+        cutoff = getattr(self, "_drift_stop_cutoff_ns", None)
+        return (self.settings.get("input_kind") == "delta_lambda_9" and cutoff is not None
+                and (_stamp(frame) or 0) > cutoff)
+
+    def _target_preload_source(self, timestamp):
+        if (self.settings.get("input_kind") == "delta_lambda_9" and self.phase == "preload"
+                and len(getattr(self, "_drift_preload_frames", {}).get(self.trial_id, [])) < 12):
+            return
+        return super()._target_preload_source(timestamp)
+
+    def drift_processing_overflow(self, frame):
+        self.drift_processing_failure(frame, "九路峰心处理队列溢出；本轮派生数据不完整，请中止重采")
+
+    def drift_processing_failure(self, frame, reason):
+        """Mark the source-time round bad without building a UI snapshot."""
+        with self.lock:
+            if not self.running or self.settings.get("input_kind") != "delta_lambda_9":
+                return
+            annotation = self._annotation(_stamp(frame))
+            trial_id = annotation.get("trial_id")
+            trial = self._trials.get(trial_id)
+            if trial is not None:
+                trial["bad"] = True
+                faults = trial.setdefault("derived_faults", [])
+                if reason not in faults:
+                    faults.append(reason)
+                state = self._timed.get("trial") or {}
+                if state.get("trial_id") == trial_id:
+                    state["faults"].add(reason)
+                    if self.phase == "saving":
+                        self._target_invalidate_checkpoint(reason, time.perf_counter_ns())
+            self._submit("events", {**annotation, "event":"nine_fbg_processing_failure", "reason":reason,
+                                   "frame_id":frame.get("frame_id"), "host_rx_monotonic_ns":_stamp(frame)})
+
+    def drift_results_checkpoint_ready(self):
+        """Fsync derived rows after the final raw recovery frame was fitted."""
+        with self.lock:
+            if self.settings.get("input_kind") != "delta_lambda_9":
+                return True
+            state = self._timed.get("trial") or {}
+            if self.phase != "saving":
+                return True
+            if getattr(self, "_drift_result_watermark_ns", 0) < (state.get("data_end_ns") or 0):
+                return False
+            if not state.get("drift_final_quality_checked"):
+                reasons = []
+                if len(self._drift_preload_frames.get(state["trial_id"], [])) < 12:
+                    reasons.append("最终采前无载段有效连续九峰不足 12 帧；迟到提峰结果不能建立本轮固定参考")
+                elif any(frame.get(key) != self.context.get(context_key)
+                         for frame in self._drift_preload_frames[state["trial_id"]]
+                         for key,context_key in (("stream_epoch","optical_epoch"),
+                                                 ("algorithm_version","algorithm_version"), ("config_version","config_version"))):
+                    reasons.append("最终采前九峰算法、配置或采集时段与本会话固定定义不一致")
+                windows = self._drift_no_contact_windows if state.get("no_contact") else self._drift_contact_windows
+                if not windows.get(state["trial_id"], 0):
+                    reasons.append("本轮没有连续 16 个有效九峰且末帧有可信六轴" + ("无接触" if state.get("no_contact") else "接触") + "标签的训练窗口")
+                if compact(self.settings) and not self._trials[state["trial_id"]].get("drift_reference"):
+                    reasons.append("寻峰漂移本轮固定九路参考尚未完成，不能保存为合格训练轮次")
+                for reason in reasons:
+                    state["faults"].add(reason)
+                    trial = self._trials[state["trial_id"]]
+                    trial["bad"] = True
+                    faults = trial.setdefault("derived_faults", [])
+                    if reason not in faults:
+                        faults.append(reason)
+                state["frozen_quality"] = self._target_quality(state)
+                state["frozen_quality"]["metrics"]["nine_fbg_contact_windows"] = self._drift_contact_windows.get(state["trial_id"], 0)
+                state["frozen_quality"]["metrics"]["nine_fbg_no_contact_windows"] = self._drift_no_contact_windows.get(state["trial_id"], 0)
+                state["frozen_quality"]["metrics"]["nine_fbg_preload_valid_frames"] = len(self._drift_preload_frames.get(state["trial_id"], []))
+                self._trials[state["trial_id"]]["quality"] = deepcopy(state["frozen_quality"])
+                state["drift_final_quality_checked"] = True
+            if not state.get("drift_checkpoint_token") or state.get("checkpoint_token") != state["drift_checkpoint_token"]:
+                token = state["checkpoint_token"] + ":drift"
+                self.writer.request_checkpoint(token)
+                state["drift_checkpoint_token"] = state["checkpoint_token"] = token
+                self._trials[state["trial_id"]]["checkpoint_token"] = token
+                self._transition("nine_fbg_results_checkpoint_requested", checkpoint_token=token,
+                                 derived_result_watermark_ns=self._drift_result_watermark_ns)
+            return self.writer.checkpoint_ready(state["drift_checkpoint_token"])
+
     def _transition(self, event, *, at_ns=None, annotate=True, **extra):
+        if compact(self.settings) and isinstance(extra.get("message"), str):
+            extra["message"] = (extra["message"].replace("软件零点与全谱参考", "六轴软件零点")
+                                .replace("全谱参考", "下一轮参考准备"))
         stamp = max(time.perf_counter_ns(), self._timeline[-1][0] if self._timeline else 0) if at_ns is None else at_ns
         marks = self._trials.get(self.trial_id, {}).get("manual_mark", [])
         state = {"session_id": self.session_id, "trial_id": self.trial_id, "point_id": self.point_id,
@@ -290,7 +470,9 @@ class ExperimentManager:
             if self.writer and not self.writer.closed:
                 if self.running:
                     if self.trial_id:
-                        if self._guided.get("enabled"):
+                        if self._timed.get("enabled"):
+                            self._timed_finish(aborted=True, reason="采集停止或断流：" + str(reason))
+                        elif self._guided.get("enabled"):
                             state = self._guided_rounds.get(self.trial_id)
                             if state:
                                 state["faults"].add("采集停止或断流：" + str(reason))
@@ -315,8 +497,15 @@ class ExperimentManager:
             if self.trial_id:
                 raise ValueError("活动试次内不能切换实验点位")
             if point_id not in {point["id"] for point in self.settings["point_grid"]}:
-                raise ValueError("实验点位不在本会话的 25 点网格内")
+                if point_id != NO_CONTACT_POINT_ID:
+                    raise ValueError("实验点位不在本会话的 25 点网格内")
+                if self.settings.get("acquisition_protocol") != "force_target_wrench_v1":
+                    raise ValueError("无接触标签使用合力目标＋手动结束采集协议")
             self.point_id = point_id
+            if self._timed.get("enabled"):
+                self._timed_select_point(point_id)
+                self._transition("point_selected")
+                return self.snapshot()
             self.baseline = {"status": "required", "ready": False}
             self.phase = "idle"
             if self._guided.get("enabled"):
@@ -332,6 +521,10 @@ class ExperimentManager:
                 raise ValueError("请明确确认接触棒已移开且当前无载")
             if self.trial_id:
                 raise ValueError("活动试次内基线与六轴零点冻结，不能重新标定")
+            if self._timed.get("enabled"):
+                current = _context(context, spectrum_only=True)
+                self._same_context(current)
+                return self._timed_baseline_request(current)
             if self._guided.get("enabled") and (self.point_id is None or self._guided["accepted_by_point"][self.point_id] >= self.settings["repetitions_per_point"]):
                 raise ValueError("请先明确确认尚未完成重复次数的点位")
             current = _context(context, stable=True)
@@ -356,6 +549,8 @@ class ExperimentManager:
             raise ValueError("设备采集时段、提峰算法或配置已改变，请结束后创建新实验会话")
 
     def _baseline_ready(self):
+        if self._timed.get("enabled"):
+            return self._timed_baseline_ready()
         if self.baseline.get("status") == "collecting" and self.baseline.get("lambda0_nm") is not None and self.baseline.get("force_zero") is not None:
             self.baseline.update(status="ready", ready=True, effective_monotonic_ns=time.perf_counter_ns())
             if self._guided.get("enabled"):
@@ -365,6 +560,9 @@ class ExperimentManager:
     def trial(self, action, context):
         with self.lock:
             self._require_running()
+            if self._timed.get("enabled"):
+                current = _context(context, spectrum_only=True) if action == "start" else None
+                return self._timed_trial(action, current)
             if self._guided.get("enabled") and action not in {"start", "abort"}:
                 raise ValueError("引导式试次阶段由真实采集帧与质量门自动推进，不能手动跳过")
             if action == "start":
@@ -374,7 +572,7 @@ class ExperimentManager:
                     raise ValueError("请确认尚未完成重复次数的点位")
                 current = _context(context, stable=True)
                 self._same_context(current)
-                if not self.settings["force_direction_confirmed"] or not self.settings["coordinates_confirmed"]:
+                if not setup_allows_trial(self.settings):
                     raise ValueError("请先明确确认法向力方向与 25 点坐标")
                 if not self.baseline.get("ready") or self.baseline.get("used") or self.baseline.get("point_id") != self.point_id:
                     raise ValueError("每次试次前都需要新的明确无载基线与六轴零点")
@@ -482,6 +680,8 @@ class ExperimentManager:
         """
         with self.lock:
             try:
+                if self._timed.get("enabled"):
+                    return self._timed_watchdog(time.perf_counter_ns() if now_ns is None else now_ns)
                 return self._preload_watchdog(time.perf_counter_ns() if now_ns is None else now_ns,
                                               inspect_sources=True)
             except Exception as exc:
@@ -489,6 +689,8 @@ class ExperimentManager:
                 return False
 
     def _guided_force(self, frame, annotation, values):
+        if self._timed.get("enabled"):
+            return self._timed_force(frame, annotation, values)
         if not self._guided.get("enabled") or annotation.get("trial_id") != self.trial_id or not self.trial_id:
             return
         if self._preload_watchdog(time.perf_counter_ns()):
@@ -630,6 +832,12 @@ class ExperimentManager:
         return "round_complete" if accepted else "retry"
 
     def _guided_result(self, row, peaks_valid, matching):
+        if self._timed.get("enabled"):
+            state = self._timed.get("trial")
+            if state and row.get("trial_id") == state["trial_id"]:
+                state["peak_processed_frames"] += 1
+                state["peak_valid_frames"] += bool(peaks_valid)
+            return
         if not self._guided.get("enabled"):
             return
         state = self._guided_rounds.get(row.get("trial_id"))
@@ -702,6 +910,18 @@ class ExperimentManager:
             self._guided_finish(state, at_ns=self._guided_boundary(stamp))
 
     def _guided_snapshot(self):
+        if self._timed.get("enabled"):
+            value = self._timed_snapshot()
+            if compact(self.settings):
+                messages = {"zeroing": "正在直接建立下一轮六轴软件零点，请保持接触棒移开",
+                            "round_complete": "本轮已保存，下一轮六轴零点已准备；开始后重新记录 2 秒无载九路参考",
+                            "retry": "本轮失败记录保留，下一轮六轴零点已准备；重新开始后记录 2 秒无载九路参考"}
+                if value.get("step") in messages and not self._timed.get("recovery_message"):
+                    value["message"] = messages[value["step"]]
+                for key in ("message", "finish_block_reason"):
+                    if isinstance(value.get(key), str):
+                        value[key] = value[key].replace("全谱参考", "下一轮参考准备")
+            return value
         if not self._guided.get("enabled"):
             return {"enabled": False}
         guided = self._guided
@@ -726,7 +946,11 @@ class ExperimentManager:
             if self.trial_id:
                 self._trials[self.trial_id]["manual_mark"].append(reason)
                 self._trials[self.trial_id]["bad"] = True
-                if self._guided.get("enabled"):
+                if self._timed.get("enabled"):
+                    self._timed["trial"]["faults"].add("人工异常：" + reason)
+                    if self.settings.get("acquisition_protocol") == "force_target_wrench_v1" and self.phase == "saving":
+                        self._target_invalidate_checkpoint("保存期间新增人工异常标记", time.perf_counter_ns())
+                elif self._guided.get("enabled"):
                     self._guided_rounds[self.trial_id]["faults"].add("人工异常：" + reason)
                     if self.phase in {"preload", "loading"}:
                         self.phase = "hold"
@@ -734,20 +958,34 @@ class ExperimentManager:
             else:
                 self.baseline.update(ready=False, status="invalid", bad=True)
                 if self._guided.get("enabled"):
-                    self._guided["step"] = "needs_baseline" if self.point_id is not None and self._guided["accepted_by_point"][self.point_id] < self.settings["repetitions_per_point"] else "select_point" if self.point_id is None else self._guided_idle_step(self.point_id)
+                    if self._no_contact_selected():
+                        self._guided["step"] = "needs_baseline"
+                    else:
+                        self._guided["step"] = "needs_baseline" if self.point_id is not None and self._guided["accepted_by_point"][self.point_id] < self.settings["repetitions_per_point"] else "select_point" if self.point_id is None else self._guided_idle_step(self.point_id)
             self._transition("manual_mark", reason=reason)
             return self.snapshot()
 
     def on_spectrum(self, frame):
         with self.lock:
-            if not self.running:
+            if not self.running or self._drift_beyond_stop(frame):
                 return False
             try:
-                row = deepcopy(frame)
+                row = dict(frame) if compact(self.settings) else deepcopy(frame)
+                if compact(self.settings) and self.writer.metadata.get("static_wavelength_nm") is None:
+                    from .peak_drift_capture import static_axis
+                    axis = static_axis({"frame": frame})
+                    if axis is not None:
+                        self.writer.metadata["static_wavelength_nm"] = axis
+                if self._timed.get("enabled"):
+                    self._timed_before_source(frame)
                 annotation = self._annotation(_stamp(frame))
                 row["source_phase"] = row.get("phase")
                 row.update(annotation, experiment=annotation)
                 self._submit("raw_spectra", row)
+                if self.settings.get("input_kind") == "delta_lambda_9":
+                    self._drift_last_spectrum_ns = max(self._drift_last_spectrum_ns, _stamp(frame) or 0)
+                if self._timed.get("enabled"):
+                    self._timed_spectrum(frame, annotation)
                 state = self._guided_rounds.get(annotation.get("trial_id"))
                 if state:
                     stamp = _stamp(frame)
@@ -767,10 +1005,12 @@ class ExperimentManager:
 
     def on_force(self, frame):
         with self.lock:
-            if not self.running:
+            if not self.running or self._drift_beyond_stop(frame):
                 return False
             try:
                 stamp, identity = _stamp(frame), _identity(frame)
+                if self._timed.get("enabled"):
+                    self._timed_before_source(frame)
                 annotation = self._annotation(stamp)
                 self._submit("raw_force", {**deepcopy(frame), **annotation, "source_phase": frame.get("phase"), "experiment": annotation})
                 if annotation["eligible"] and frame.get("stream_epoch") != self.context["force_epoch"]:
@@ -805,7 +1045,8 @@ class ExperimentManager:
                     chosen = [self._zero_samples[round(i * (len(self._zero_samples) - 1) / 11)] for i in range(12)]
                     offsets = [statistics.median(sample["values"][axis] for sample in chosen) for axis in range(6)]
                     baseline.update(force_zero=offsets, force_noise_N=1.4826 * statistics.median(abs(sample["values"][2] - offsets[2]) for sample in chosen),
-                                    force_frame_ids=[sample["identity"][1] for sample in chosen], force_span_ms=(chosen[-1]["stamp"] - chosen[0]["stamp"]) / 1e6)
+                                    force_noise_axes=[1.4826 * statistics.median(abs(sample["values"][axis] - offsets[axis]) for sample in chosen) for axis in range(6)],
+                                    force_frame_ids=[sample["identity"][1] for sample in chosen], force_source_stamps_ns=[sample["stamp"] for sample in chosen], force_span_ms=(chosen[-1]["stamp"] - chosen[0]["stamp"]) / 1e6)
                     self._transition("force_zero_ready", baseline=deepcopy(baseline))
                     self._baseline_ready()
                 return True
@@ -865,10 +1106,14 @@ class ExperimentManager:
 
     def on_result(self, result, sync):
         with self.lock:
-            if not self.running:
+            if not self.running or self._drift_beyond_stop(result):
                 return False
             try:
                 annotation = self._annotation(_stamp(result))
+                if compact(self.settings) and annotation.get("eligible") is not True:
+                    # A live display fit may finish after this session starts,
+                    # although its optical source predates the writer boundary.
+                    return False
                 baseline = self.baseline
                 centers = _peaks(result)
                 if baseline.get("status") == "collecting" and baseline.get("lambda0_nm") is None and annotation.get("baseline_id") == baseline["baseline_id"] and _stamp(result) is not None and _stamp(result) >= baseline["requested_monotonic_ns"]:
@@ -891,32 +1136,81 @@ class ExperimentManager:
                 noise_threshold = max(0.05, 3 * (locked.get("force_noise_N") or 0))
                 lateral_ratio = math.hypot(corrected[0], corrected[1]) / abs(corrected[2]) if corrected and abs(corrected[2]) > noise_threshold else None
                 contact = annotation.get("point_id") if annotation.get("trial_id") and annotation.get("phase") in {"loading", "hold"} else None
-                row = {**annotation, "point_id": contact, "selected_point_id": annotation.get("point_id"), "result": deepcopy(result), "sync": checked,
+                saved_result = ({"drift_features": deepcopy(result.get("drift_features") or {})}
+                                if compact(self.settings) else deepcopy(result))
+                row = {**annotation, "point_id": contact, "selected_point_id": annotation.get("point_id"), "result": saved_result, "sync": checked,
                        "x_pm": x_pm, "force_N": normal, "force_corrected": corrected, "valid": valid,
                        "source_kind": result.get("source_kind", "hardware"), "algorithm_version": result.get("algorithm_version"), "config_version": result.get("config_version"),
                        "reference_version": result.get("reference_version"), "split": self.settings["batch"], "bad": bad,
                        "lateral_ratio": lateral_ratio, "lateral_warning": lateral_ratio is not None and lateral_ratio > 0.2,
                        "force_limit_exceeded": normal is not None and normal > self.settings["max_force_N"],
                        "force_noise_threshold_N": noise_threshold, "frame_id": result.get("frame_id"), "host_rx_monotonic_ns": _stamp(result)}
+                self._compact_freeze_drift_reference(annotation)
                 self._submit("results", row)
+                if self.settings.get("input_kind") == "delta_lambda_9":
+                    self._drift_result_watermark_ns = max(self._drift_result_watermark_ns, _stamp(result) or 0)
+                    feature = result.get("drift_features") or {}
+                    tail = self._drift_training_tail.setdefault(annotation.get("trial_id"), [])
+                    usable_phase = annotation.get("phase") in {"preload", "waiting_contact", "loading", "release", "no_contact"}
+                    if (not usable_phase or feature.get("all_valid") is not True or feature.get("source_valid") is not True
+                            or tail and (not 0 < (_stamp(result) or 0)-tail[-1]["host_rx_monotonic_ns"] <= 120_000_000
+                                or any(feature.get(key) != tail[-1].get(key) for key in
+                                       ("stream_epoch", "algorithm_version", "config_version", "axis_sha256", "preprocessing")))):
+                        tail.clear()
+                    if usable_phase and feature.get("all_valid") is True and feature.get("source_valid") is True:
+                        tail.append(deepcopy(feature))
+                        del tail[:-16]
+                        if (len(tail) == 16 and annotation.get("trial_id") and annotation.get("phase") in {"loading", "release"}
+                                and corrected is not None and math.sqrt(sum(value*value for value in corrected[:3])) > self._wrench_rules()["contact_force_norm_N"]):
+                            trial_id = annotation["trial_id"]
+                            self._drift_contact_windows[trial_id] = self._drift_contact_windows.get(trial_id, 0)+1
+                        if (len(tail) == 16 and annotation.get("trial_id") and annotation.get("phase") == "no_contact"
+                                and annotation.get("point_id") == NO_CONTACT_POINT_ID and checked.get("valid") is True):
+                            trial_id = annotation["trial_id"]
+                            self._drift_no_contact_windows[trial_id] = self._drift_no_contact_windows.get(trial_id, 0)+1
+                    if annotation.get("phase") == "preload" and annotation.get("trial_id") == self.trial_id:
+                        frames = self._drift_preload_frames.setdefault(self.trial_id, [])
+                        if (feature.get("all_valid") is not True or feature.get("source_valid") is not True
+                                or frames and (not 0 < (_stamp(result) or 0)-frames[-1]["host_rx_monotonic_ns"] <= 120_000_000
+                                    or any(feature.get(key) != frames[-1].get(key) for key in
+                                           ("stream_epoch", "algorithm_version", "config_version", "axis_sha256", "preprocessing")))):
+                            frames.clear()
+                        if feature.get("all_valid") is True and feature.get("source_valid") is True:
+                            frames.append(deepcopy(feature))
+                        state = self._timed.get("trial") or {}
+                        latest = [state.get("last_force_ns"), state.get("last_spectrum_ns")]
+                        if all(type(value) is int for value in latest):
+                            self._target_preload_source(max(latest))
                 self._guided_result(row, centers is not None, matching)
                 return True
             except Exception as exc:
                 self._fail(exc)
                 return False
 
+    def coordination_snapshot(self):
+        """Read only the capture handshake state, without UI/evidence copies.
+
+        The service coordinator runs more often than the UI. It must not scan
+        trial labels, copy 512-point references, or query the writer merely to
+        decide whether training needs to pause for the active trial.
+        """
+        with self.lock:
+            return {"running": self.running,
+                    "acquisition_protocol": self.settings.get("acquisition_protocol"),
+                    "trial_id": self.trial_id}
+
     def snapshot(self):
         with self.lock:
             writer = self.writer.status() if self.writer else {}
             counts = dict(self.counts)
-            for kind in ("raw_spectra", "raw_force", "results", "events"):
+            for kind in ("raw_spectra", "raw_force", "results", "events", "optical_sources", "peak_frames"):
                 if kind in counts:
                     counts[kind] = writer.get("counts", {}).get(kind, 0)
             return clean({"running": self.running, "session_id": self.session_id, "path": writer.get("path"),
                           "settings": deepcopy(self.settings), "point_id": self.point_id, "trial_id": self.trial_id,
                           "phase": self.phase, "baseline": deepcopy(self.baseline), "status": self.status,
                           "guided": self._guided_snapshot(),
-                          "counts": counts, "accepted_counts": {kind: self.counts.get(kind, 0) for kind in ("raw_spectra", "raw_force", "results", "events")}, "writer_queue_depth": writer.get("queue_depth", 0),
+                          "counts": counts, "accepted_counts": {kind: self.counts.get(kind, 0) for kind in ("raw_spectra", "raw_force", "results", "events", "optical_sources", "peak_frames")}, "writer_queue_depth": writer.get("queue_depth", 0),
                           "saved_counts": writer.get("counts", {}), "error": self.error or writer.get("error")})
 
     def list_sessions(self):
@@ -950,8 +1244,10 @@ def _session_summary(manifest):
     trials = final.get("trials") if isinstance(final.get("trials"), list) else []
     trials = [trial for trial in trials if isinstance(trial, dict)]
     guided = settings.get("guided_acquisition") is True
+    timed = settings.get("acquisition_protocol") == "timed_wrench_v1"
+    force_target = settings.get("acquisition_protocol") == "force_target_wrench_v1"
     repetitions = settings.get("repetitions_per_point", 3)
-    if type(repetitions) is not int or not 3 <= repetitions <= 999:
+    if type(repetitions) is not int or not 1 <= repetitions <= 999:
         repetitions = 3
     grid = settings.get("point_grid") if isinstance(settings.get("point_grid"), list) else []
     coordinates = {}
@@ -960,15 +1256,50 @@ def _session_summary(manifest):
             coordinates.setdefault(point["id"], {"row": point.get("row"), "col": point.get("col")})
     points = {}
     accepted_count = rejected_count = pending_count = legacy_count = 0
+    drift_candidate_count = 0
+    drift_trial_reason = None
+    drift_criteria = settings.get("force_target_wrench_criteria")
+    drift_criteria = drift_criteria if isinstance(drift_criteria, dict) else {}
+    no_contact_count = accepted_no_contact_count = 0
     for trial in trials:
         quality = trial.get("quality") if isinstance(trial.get("quality"), dict) else {}
-        trial_guided = guided or trial.get("guided") is True
+        trial_guided = guided or trial.get("guided") is True or force_target
+        supported_quality = ({"force_target_wrench_quality_v1", "force_target_wrench_quality_v2"} if force_target
+                             else {"timed_wrench_quality_v1"} if timed else {"guided_round_v1"})
         accepted = (trial.get("status") == "completed" and not trial.get("bad") and not trial.get("manual_mark")
                     and (not trial_guided or (quality.get("accepted") is True
-                                             and quality.get("criteria_version") == "guided_round_v1")))
+                                             and quality.get("criteria_version") in supported_quality)))
+        no_contact = is_no_contact_trial(trial)
+        if no_contact:
+            no_contact_count += 1
+            try:
+                validate_no_contact_trial(trial, settings.get("no_contact_criteria") or {})
+                accepted = force_target
+            except (ValueError, TypeError, KeyError):
+                accepted = False
+            accepted_no_contact_count += int(accepted)
         if accepted:
             accepted_count += 1
             legacy_count += int(not trial_guided)
+            metrics = quality.get("metrics") if isinstance(quality.get("metrics"), dict) else {}
+            recorded = metrics.get("preload_recorded_duration_s")
+            prompt = metrics.get("press_prompt_monotonic_ns")
+            drift_candidate = (force_target and quality.get("criteria_version") == "force_target_wrench_quality_v2"
+                               and drift_criteria.get("criteria_version") == "force_target_wrench_quality_v2"
+                               and drift_criteria.get("preload_duration_s") == 2
+                               and metrics.get("preload_duration_s") == 2
+                               and metrics.get("preload_contact_detected") is False
+                               and _finite(recorded) and recorded >= 2
+                               and type(prompt) is int and prompt > 0)
+            if no_contact:
+                drift_candidate = accepted and type(prompt) is int and prompt > 0
+            if drift_candidate and settings.get("input_kind") == "delta_lambda_9":
+                count = metrics.get("nine_fbg_preload_valid_frames")
+                windows = metrics.get("nine_fbg_no_contact_windows" if no_contact else "nine_fbg_contact_windows")
+                drift_candidate = type(count) is int and count >= 12 and type(windows) is int and windows >= 1
+            drift_candidate_count += int(drift_candidate)
+            if not drift_candidate and drift_trial_reason is None:
+                drift_trial_reason = "合格轮次缺少九路漂移所需的明确无接触 2 秒采前基线或有效九峰窗口；请使用新流程重新采集"
         elif trial.get("status") in {"completed", "aborted"}:
             rejected_count += 1
         else:
@@ -981,8 +1312,9 @@ def _session_summary(manifest):
     ordered_ids = [point_id for point_id in coordinates if point_id in points]
     ordered_ids.extend(sorted(set(points) - set(ordered_ids)))
     point_summary = [points[point_id] for point_id in ordered_ids]
-    point_count = sum(point["accepted"] > 0 for point in point_summary)
-    completed_points = sum(point["accepted"] >= repetitions for point in point_summary)
+    spatial_points = [point for point in point_summary if point["point_id"] in coordinates]
+    point_count = sum(point["accepted"] > 0 for point in spatial_points)
+    completed_points = sum(point["accepted"] >= repetitions for point in spatial_points)
     required_ids = {"P%02d" % number for number in range(1, 26)}
     acquisition_complete = (guided and required_ids.issubset(coordinates)
                             and all(points.get(point_id, {}).get("accepted", 0) >= repetitions for point_id in required_ids))
@@ -990,13 +1322,28 @@ def _session_summary(manifest):
     diagnostic = explicit_diagnostic or (accepted_count == 0 and isinstance(settings.get("finger_id"), str)
                                           and settings["finger_id"].startswith("诊断0.4.2_"))
     complete = manifest.get("complete") is True
+    drift_available = bool(complete and not diagnostic and accepted_count > 0 and drift_candidate_count == accepted_count)
+    spectral_available = bool(not compact(settings) and complete and not diagnostic and accepted_count > 0)
+    drift_reason = (None if drift_available else "会话尚未完整保存" if not complete else
+                    "诊断会话不参与训练" if diagnostic else "会话没有合格轮次" if not accepted_count else
+                    "旧采集协议未提供九路漂移所需的明确无接触 2 秒采前基线；请使用新流程重新采集" if not force_target else
+                    drift_trial_reason)
     return {"summary_schema": "session_summary_v1", "data_id": settings.get("data_id") if isinstance(settings.get("data_id"), str) else "", "trial_count": len(trials),
             "accepted_trial_count": accepted_count, "rejected_trial_count": rejected_count,
+            "no_contact_trial_count": no_contact_count, "accepted_no_contact_trial_count": accepted_no_contact_count,
+            "no_contact_label": NO_CONTACT_POINT_ID,
             "pending_trial_count": pending_count, "legacy_candidate_trial_count": legacy_count,
             "has_training_data": complete and accepted_count > 0 and not diagnostic,
+            "drift_available": drift_available, "drift_unavailable_reason": drift_reason,
+            "capture_mode": settings.get("capture_mode", "historical"),
+            "recording_schema": manifest.get("recording_schema"),
+            "spectral_available": spectral_available,
+            "spectral_unavailable_reason": "寻峰漂移会话只保存九路峰心曲线，不能用于 512 点全谱训练" if compact(settings) else None,
+            "drift_candidate_trial_count": drift_candidate_count,
+            "drift_availability_scope": "manifest_preload_candidate_only",
             "diagnostic": diagnostic, "started_utc": manifest.get("started_utc"),
             "ended_utc": manifest.get("ended_utc"), "point_summary": point_summary,
-            "point_count": point_count, "attempted_point_count": len(point_summary),
+            "point_count": point_count, "attempted_point_count": len(spatial_points),
             "completed_point_count": completed_points, "required_point_count": 25,
             "repetitions_per_point": repetitions, "total_required": 25 * repetitions,
             "acquisition_complete": acquisition_complete, "formal_training_qualified": False}

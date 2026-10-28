@@ -1,130 +1,119 @@
-"""Exercise the delivered Windows launcher without connecting any instruments."""
+"""Native Windows launcher acceptance, isolated from operator data and devices."""
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
+import sys
 import time
-import urllib.error
-import urllib.request
 
 import pytest
 
 from ninefbg import PRODUCT, VERSION
 
 
-pytestmark = pytest.mark.skipif(os.name != "nt", reason="真实 Windows cmd 启动回归")
+def test_all_production_entry_points_use_native_pyqt():
+    root = Path(__file__).resolve().parents[1]
+    launcher = (root / "9FBG-Dev.cmd").read_text(encoding="utf-8")
+    assert "-m ninefbg.qt_app" in launcher
+    assert "pip install" not in launcher and "pytest" not in launcher
+    assert "ninefbg.server" not in launcher
+    assert "qt_app import main" in (root / "ninefbg/__main__.py").read_text(encoding="utf-8")
+    from ninefbg import server
+    import inspect
+    source = inspect.getsource(server.main)
+    assert "desktop_main" in source and "webbrowser" not in source and "LocalServer" not in source
 
 
-def _read_state(url):
-    with urllib.request.urlopen(url + "/api/state", timeout=0.5) as response:
-        return json.load(response)
+def test_native_instance_identity_preserves_operator_data_separation(tmp_path):
+    from ninefbg.qt_app import instance_name
+    assert instance_name(tmp_path) == instance_name(tmp_path / ".." / tmp_path.name)
+    assert instance_name(tmp_path) != instance_name(tmp_path / "other")
 
 
-def _shutdown(url):
-    request = urllib.request.Request(
-        url + "/api/shutdown", data=b"{}", method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return json.load(response)
+def test_window_construction_failure_closes_started_background_workers(tmp_path):
+    code = """
+import sys
+from ninefbg import qt_app
+contexts = []
+cleaned = []
+OriginalContext = qt_app.AppContext
+class CheckedContext(OriginalContext):
+    def join(self, *args, **kwargs):
+        super().join(*args, **kwargs)
+        assert not self._commands.isRunning() and not self._reads.isRunning()
+        cleaned.append(True)
+qt_app.AppContext = CheckedContext
+def broken(context):
+    contexts.append(context)
+    raise RuntimeError('injected native widget constructor failure')
+qt_app.MainWindow = broken
+try:
+    qt_app.main(['--userdata', sys.argv[1]])
+except RuntimeError as error:
+    assert 'injected' in str(error)
+else:
+    raise AssertionError('constructor failure was not propagated')
+assert contexts and cleaned
+assert not contexts[0].service.running
+print('workers closed')
+"""
+    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONUTF8": "1"}
+    result = subprocess.run([sys.executable, "-c", code, str(tmp_path / "constructor-failure")],
+                            cwd=Path(__file__).resolve().parents[1], env=env, capture_output=True, timeout=15)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    assert b"workers closed" in result.stdout
 
 
-def test_production_cmd_cold_start_reuse_and_controlled_shutdown(tmp_path):
-    """A shortcut's actual .cmd must survive Chinese paths and launch arguments.
-
-    No /api/connect request is made. An independent port/userdata prevents this
-    test from reusing, stopping or writing into the operator's normal service.
-    """
+@pytest.mark.skipif(os.name != "nt", reason="真实 Windows cmd 启动回归")
+def test_production_cmd_native_cold_start_without_hardware_or_http(tmp_path):
     root = Path(__file__).resolve().parents[1]
     launcher = root / "9FBG-Dev.cmd"
     comspec = Path(os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"))
-    assert launcher.is_file()
-    assert comspec.is_file()
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
-    userdata = tmp_path / "启动验证 data"
-    url = f"http://127.0.0.1:{port}"
-    # Pass the raw Unicode command line to CreateProcess. /s /c uses the normal
-    # outer quote pair, retaining quotes around the production batch and data.
-    # list2cmdline backslash escaping is inappropriate inside cmd's /c string.
-    command = (
-        f'"{comspec}" /d /s /c ""{launcher}" '
-        f'--no-browser --port {port} --userdata "{userdata}""'
-    )
-    log_path = tmp_path / "cold-launch.log"
-    reuse_log_path = tmp_path / "reuse-launch.log"
-    started = None
-    ready = False
-    with log_path.open("wb") as output:
+    userdata = tmp_path / "原生启动验证 data"
+    report_path = tmp_path / "native-smoke.json"
+    command = f'"{comspec}" /d /s /c ""{launcher}" --userdata "{userdata}" --smoke-test "{report_path}""'
+    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONUTF8": "1"}
+    result = subprocess.run(command, executable=str(comspec), cwd=tmp_path, env=env,
+                            capture_output=True, timeout=40, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 0, result.stdout.decode("utf-8", "replace") + result.stderr.decode("utf-8", "replace")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["gui"] == "PyQt6" and not report["http_server"]
+    assert report["product"] == PRODUCT == "9FBG" and report["version"] == VERSION
+    assert report["window_title"] == f"9FBG {VERSION}"
+    state = report["state"]
+    assert not state["running"] and not state["recording"]
+    assert state["devices"] == [] and state["session"] is None
+    assert not userdata.exists(), "普通启动/查看页面不能建立测量数据或改写设置"
+    assert len(report["screenshots"]) == 3
+    assert all(Path(path).stat().st_size > 10000 for path in report["screenshots"])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 本地桌面实例回归")
+def test_second_native_launch_activates_existing_window_without_new_service(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    userdata = tmp_path / "单实例数据"
+    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONUTF8": "1"}
+    command = [sys.executable, "-m", "ninefbg.qt_app", "--userdata", str(userdata), "--quit-after-ms", "6500"]
+    with (tmp_path / "first.log").open("wb") as log:
+        first = subprocess.Popen(command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
         try:
-            # Intentionally run from outside the application directory: the
-            # real shortcut can have another cwd and must rely on %~dp0.
-            started = subprocess.Popen(
-                command, executable=str(comspec), cwd=tmp_path,
-                stdout=output, stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            deadline = time.perf_counter() + 25
-            state = None
-            while time.perf_counter() < deadline:
-                if started.poll() is not None:
-                    pytest.fail(
-                        f"生产批处理冷启动提前退出 {started.returncode}：\n"
-                        + log_path.read_text(encoding="utf-8", errors="replace")
-                    )
-                try:
-                    state = _read_state(url)
-                    ready = True
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                if "原生 PyQt6 已启动" in (tmp_path / "first.log").read_text(encoding="utf-8", errors="replace"):
                     break
-                except (urllib.error.URLError, TimeoutError, ConnectionError):
-                    time.sleep(0.05)
-            assert ready, "生产批处理冷启动未在独立端口提供状态接口"
-            assert state["product"] == PRODUCT == "9FBG"
-            assert state["version"] == VERSION
-            assert state["running"] is False
-            assert state["session"] is None
-            assert state["devices"] == []
-            assert not (userdata / "sessions").exists(), "源码启动不应建立硬件采集会话"
-
-            begin_reuse = time.perf_counter()
-            with reuse_log_path.open("wb") as reuse_output:
-                reused = subprocess.run(
-                    command, executable=str(comspec), cwd=tmp_path,
-                    stdout=reuse_output, stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NO_WINDOW, timeout=12,
-                )
-            assert reused.returncode == 0, reuse_log_path.read_text(encoding="utf-8", errors="replace")
-            assert time.perf_counter() - begin_reuse < 12
-            assert "已复用现有工作台" in reuse_log_path.read_text(encoding="utf-8", errors="replace")
-            assert started.poll() is None, "重复启动应复用原服务，而不终止冷启动进程"
-            reused_state = _read_state(url)
-            assert reused_state["version"] == VERSION
-            assert reused_state["running"] is False
-            assert reused_state["devices"] == []
-            assert reused_state["session"] is None
-
-            closed = _shutdown(url)
-            assert closed["running"] is False
-            assert closed.get("stopping") is False
-            assert started.wait(timeout=12) == 0, "受控退出应让生产 cmd 正常返回"
-            assert not (userdata / "sessions").exists()
+                assert first.poll() is None
+                time.sleep(.05)
+            second = subprocess.run(command[:-2], cwd=root, env=env, capture_output=True,
+                                     timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+            assert second.returncode == 0
+            assert "已激活现有桌面窗口" in second.stdout.decode("utf-8", "replace")
+            assert first.poll() is None
+            assert first.wait(timeout=15) == 0
+            assert not userdata.exists()
         finally:
-            if started is not None and started.poll() is None:
-                if ready:
-                    try:
-                        _shutdown(url)
-                        started.wait(timeout=8)
-                    except (OSError, ValueError, subprocess.TimeoutExpired):
-                        pass
-                if started.poll() is None:
-                    # Failure cleanup applies only to this test's own process
-                    # tree, which has never received a hardware connect call.
-                    subprocess.run(
-                        ["taskkill", "/PID", str(started.pid), "/T", "/F"],
-                        capture_output=True, timeout=8,
-                    )
-                    started.wait(timeout=8)
+            if first.poll() is None:
+                first.terminate()
+                first.wait(timeout=10)

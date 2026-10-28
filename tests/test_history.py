@@ -317,9 +317,10 @@ def test_missing_or_file_shaped_session_is_not_a_resolvable_source(tmp_path):
         session_path(tmp_path, "missing", include_deleted=True)
 
 
-def test_linked_raw_file_cannot_be_resolved_opened_or_moved(tmp_path, monkeypatch):
+@pytest.mark.parametrize("record_name", ["raw_force.jsonl", "optical_sources.jsonl", "peak_frames.jsonl"])
+def test_linked_raw_file_cannot_be_resolved_opened_or_moved(tmp_path, monkeypatch, record_name):
     directory = archive(tmp_path)
-    raw = directory/"raw_force.jsonl"
+    raw = directory/record_name
     outside = tmp_path/"outside_force.jsonl"
     outside.write_bytes(b"unrelated force evidence\n")
     original = Path.is_symlink

@@ -12,6 +12,7 @@ import math
 from pathlib import Path
 
 from .experiment import AXES, IDS, UNITS, _force_values
+from .capture_setup import setup_allows_trial
 from .storage import clean
 from .sync import ForceSynchronizer
 from .tracking import ALGORITHM_VERSION, DEFAULT_CONFIG, PeakTracker, digest
@@ -335,7 +336,7 @@ def reprocess_session(path, manifest, progress=None):
         bad = bool(annotation.get("manual_mark")) or baseline.get("bad") is True or trial.get("bad") is True
         phase = annotation.get("phase")
         matching_annotation = (annotation.get("eligible") is True and annotation.get("session_id") == manifest.get("session_id") and isinstance(phase, str) and phase in _PHASES and annotation.get("point_id") == baseline.get("point_id") and (phase == "unloaded" and trial_key is None or isinstance(trial_key, str) and bool(trial_key) and trial.get("baseline_id") == baseline_key and trial.get("point_id") == annotation.get("point_id")))
-        valid = bool(valid_peaks and ready and sync.get("valid") is True and matching_annotation and frame.get("source_kind") == "hardware" and _trusted_time(frame) and frame.get("valid") is not False and frame.get("stale") is not True and settings.get("force_direction_confirmed") is True and settings.get("coordinates_confirmed") is True and not bad)
+        valid = bool(valid_peaks and ready and sync.get("valid") is True and matching_annotation and frame.get("source_kind") == "hardware" and _trusted_time(frame) and frame.get("valid") is not False and frame.get("stale") is not True and setup_allows_trial(settings) and not bad)
         noise = baseline.get("force_noise_N")
         threshold = max(0.05, 3 * noise) if _finite(noise) and noise >= 0 else 0.05
         ratio = math.hypot(corrected[0], corrected[1])/abs(corrected[2]) if corrected is not None and abs(corrected[2]) > threshold else None

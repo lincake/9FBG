@@ -1,0 +1,199 @@
+"""Exercise the delivered Windows launcher without connecting any instruments."""
+from __future__ import annotations
+
+import json
+import io
+import os
+from pathlib import Path
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from unittest.mock import Mock
+
+import pytest
+
+from ninefbg import PRODUCT, VERSION
+from ninefbg import server as launcher_server
+
+
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="真实 Windows cmd 启动回归")
+
+
+@pytest.mark.parametrize("existing_version", ["0.14.0", VERSION])
+def test_reused_service_reports_actual_version_and_opens_versioned_ui(monkeypatch, tmp_path, capsys, existing_version):
+    """Reopening the UI must disclose an older backend and leave devices alone."""
+    url = "http://127.0.0.1:19131"
+    service = Mock()
+    service_factory = Mock(return_value=service)
+    monkeypatch.setattr(launcher_server, "AcquisitionService", service_factory)
+    monkeypatch.setattr(launcher_server, "LocalServer", Mock(side_effect=OSError("port occupied")))
+    response = io.BytesIO(json.dumps({"product": PRODUCT, "version": existing_version}).encode("utf-8"))
+    request = Mock(return_value=response)
+    browser = Mock()
+    monkeypatch.setattr(launcher_server.urllib.request, "urlopen", request)
+    monkeypatch.setattr(launcher_server.webbrowser, "open", browser)
+    monkeypatch.setattr("sys.argv", ["9FBG", "--port", "19131", "--userdata", str(tmp_path)])
+
+    launcher_server.main()
+
+    request.assert_called_once_with(url + "/api/state", timeout=1)
+    browser.assert_called_once_with(f"{url}/?version={VERSION}")
+    output = capsys.readouterr().out
+    assert f"服务版本 {existing_version}" in output
+    assert f"本次界面版本 {VERSION}" in output
+    assert "已复用现有工作台" in output
+    assert ("现有采集服务尚未更新" in output) == (existing_version != VERSION)
+    assert service.mock_calls == [], "复用工作台不得连接、断开、关闭或重启采集服务"
+
+
+def test_cold_start_opens_versioned_ui(monkeypatch, tmp_path, capsys):
+    service, server, browser, request = Mock(), Mock(), Mock(), Mock()
+    monkeypatch.setattr(launcher_server, "AcquisitionService", Mock(return_value=service))
+    monkeypatch.setattr(launcher_server, "LocalServer", Mock(return_value=server))
+    monkeypatch.setattr(launcher_server.webbrowser, "open", browser)
+    monkeypatch.setattr(launcher_server.urllib.request, "urlopen", request)
+    monkeypatch.setattr(launcher_server.signal, "signal", Mock())
+    monkeypatch.setattr("sys.argv", ["9FBG", "--port", "19131", "--userdata", str(tmp_path)])
+
+    launcher_server.main()
+
+    browser.assert_called_once_with(f"http://127.0.0.1:19131/?version={VERSION}")
+    assert f"9FBG {VERSION} 已启动" in capsys.readouterr().out
+    request.assert_not_called()
+    service.connect.assert_not_called()
+    service.disconnect.assert_not_called()
+    service.close.assert_called_once_with()
+    server.serve_forever.assert_called_once_with(poll_interval=.2)
+    server.server_close.assert_called_once_with()
+
+
+def test_launcher_refuses_other_product_without_device_requests(monkeypatch, tmp_path):
+    service, browser = Mock(), Mock()
+    monkeypatch.setattr(launcher_server, "AcquisitionService", Mock(return_value=service))
+    monkeypatch.setattr(launcher_server, "LocalServer", Mock(side_effect=OSError("port occupied")))
+    response = io.BytesIO(json.dumps({"product": "other", "version": VERSION}).encode("utf-8"))
+    request = Mock(return_value=response)
+    monkeypatch.setattr(launcher_server.urllib.request, "urlopen", request)
+    monkeypatch.setattr(launcher_server.webbrowser, "open", browser)
+    monkeypatch.setattr("sys.argv", ["9FBG", "--port", "19131", "--userdata", str(tmp_path)])
+
+    with pytest.raises(SystemExit, match="本机端口 19131 已被占用"):
+        launcher_server.main()
+
+    request.assert_called_once_with("http://127.0.0.1:19131/api/state", timeout=1)
+    browser.assert_not_called()
+    assert service.mock_calls == []
+
+
+def _read_state(url):
+    with urllib.request.urlopen(url + "/api/state", timeout=0.5) as response:
+        return json.load(response)
+
+
+def _shutdown(url):
+    request = urllib.request.Request(
+        url + "/api/shutdown", data=b"{}", method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+
+def test_production_cmd_cold_start_reuse_and_controlled_shutdown(tmp_path):
+    """A shortcut's actual .cmd must survive Chinese paths and launch arguments.
+
+    No /api/connect request is made. An independent port/userdata prevents this
+    test from reusing, stopping or writing into the operator's normal service.
+    """
+    root = Path(__file__).resolve().parents[1]
+    launcher = root / "9FBG-Dev.cmd"
+    comspec = Path(os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"))
+    assert launcher.is_file()
+    assert comspec.is_file()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    userdata = tmp_path / "启动验证 data"
+    url = f"http://127.0.0.1:{port}"
+    # Pass the raw Unicode command line to CreateProcess. /s /c uses the normal
+    # outer quote pair, retaining quotes around the production batch and data.
+    # list2cmdline backslash escaping is inappropriate inside cmd's /c string.
+    command = (
+        f'"{comspec}" /d /s /c ""{launcher}" '
+        f'--no-browser --port {port} --userdata "{userdata}""'
+    )
+    log_path = tmp_path / "cold-launch.log"
+    reuse_log_path = tmp_path / "reuse-launch.log"
+    started = None
+    ready = False
+    with log_path.open("wb") as output:
+        try:
+            # Intentionally run from outside the application directory: the
+            # real shortcut can have another cwd and must rely on %~dp0.
+            started = subprocess.Popen(
+                command, executable=str(comspec), cwd=tmp_path,
+                stdout=output, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            deadline = time.perf_counter() + 25
+            state = None
+            while time.perf_counter() < deadline:
+                if started.poll() is not None:
+                    pytest.fail(
+                        f"生产批处理冷启动提前退出 {started.returncode}：\n"
+                        + log_path.read_text(encoding="utf-8", errors="replace")
+                    )
+                try:
+                    state = _read_state(url)
+                    ready = True
+                    break
+                except (urllib.error.URLError, TimeoutError, ConnectionError):
+                    time.sleep(0.05)
+            assert ready, "生产批处理冷启动未在独立端口提供状态接口"
+            assert state["product"] == PRODUCT == "9FBG"
+            assert state["version"] == VERSION
+            assert state["running"] is False
+            assert state["session"] is None
+            assert state["devices"] == []
+            assert not (userdata / "sessions").exists(), "源码启动不应建立硬件采集会话"
+
+            begin_reuse = time.perf_counter()
+            with reuse_log_path.open("wb") as reuse_output:
+                reused = subprocess.run(
+                    command, executable=str(comspec), cwd=tmp_path,
+                    stdout=reuse_output, stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NO_WINDOW, timeout=12,
+                )
+            assert reused.returncode == 0, reuse_log_path.read_text(encoding="utf-8", errors="replace")
+            assert time.perf_counter() - begin_reuse < 12
+            assert "已复用现有工作台" in reuse_log_path.read_text(encoding="utf-8", errors="replace")
+            assert started.poll() is None, "重复启动应复用原服务，而不终止冷启动进程"
+            reused_state = _read_state(url)
+            assert reused_state["version"] == VERSION
+            assert reused_state["running"] is False
+            assert reused_state["devices"] == []
+            assert reused_state["session"] is None
+
+            closed = _shutdown(url)
+            assert closed["running"] is False
+            assert closed.get("stopping") is False
+            assert started.wait(timeout=12) == 0, "受控退出应让生产 cmd 正常返回"
+            assert not (userdata / "sessions").exists()
+        finally:
+            if started is not None and started.poll() is None:
+                if ready:
+                    try:
+                        _shutdown(url)
+                        started.wait(timeout=8)
+                    except (OSError, ValueError, subprocess.TimeoutExpired):
+                        pass
+                if started.poll() is None:
+                    # Failure cleanup applies only to this test's own process
+                    # tree, which has never received a hardware connect call.
+                    subprocess.run(
+                        ["taskkill", "/PID", str(started.pid), "/T", "/F"],
+                        capture_output=True, timeout=8,
+                    )
+                    started.wait(timeout=8)

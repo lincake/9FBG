@@ -54,7 +54,8 @@ def session_path(userdata, session_id, *, include_deleted=False):
     path = active if active.is_dir() else deleted if include_deleted and deleted.is_dir() else None
     if path is None:
         raise ValueError(MISSING)
-    for name in ("manifest.json", "raw_spectra.jsonl", "raw_force.jsonl", "results.jsonl", "events.jsonl"):
+    for name in ("manifest.json", "raw_spectra.jsonl", "raw_force.jsonl", "results.jsonl", "events.jsonl",
+                 "optical_sources.jsonl", "peak_frames.jsonl"):
         file = path / name
         if _linked(file) or file.resolve().parent != path.resolve():
             raise ValueError("采集数据文件存在链接或超出允许目录")

@@ -8,7 +8,7 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-"%~dp0.venv\Scripts\python.exe" -m ninefbg.server %*
+"%~dp0.venv\Scripts\python.exe" -m ninefbg.qt_app %*
 set "NINEFBG_EXIT_CODE=%ERRORLEVEL%"
 if not "%NINEFBG_EXIT_CODE%"=="0" (
   echo 9FBG 启动失败，请查看上方错误信息。

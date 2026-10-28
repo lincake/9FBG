@@ -30,6 +30,13 @@ class SessionWriter:
         name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:10]
         self.path = root / name
         self.path.mkdir(parents=True, exist_ok=False)
+        from .peak_drift_capture import RECORDING_SCHEMA, project
+        self.compact = metadata.get("recording_schema") == RECORDING_SCHEMA
+        if self.compact:
+            axis = metadata.get("static_wavelength_nm")
+            metadata = project(metadata)
+            if axis is not None:
+                metadata["static_wavelength_nm"] = clean(axis)
         self.metadata = {"product": PRODUCT, "version": VERSION, "session_id": name,
                          "started_utc": datetime.now(timezone.utc).isoformat(), **metadata}
         self.queue = queue.Queue(maxsize=capacity)
@@ -39,14 +46,20 @@ class SessionWriter:
         self.accepted = 0
         self.overflow = 0
         self.closed = False
+        self.last_checkpoint = None
+        self.checkpoint_requested = None
         self.thread = threading.Thread(target=self._run, name="9FBG-writer", daemon=True)
         self.thread.start()
 
     def submit(self, kind: str, value: dict):
         if self.error or self.closed:
             raise RuntimeError(self.error or "会话已关闭，不能写入")
-        if kind not in {"raw_spectra", "raw_force", "results", "events"}:
+        allowed = {"optical_sources", "peak_frames", "raw_force", "events"} if self.compact else {"raw_spectra", "raw_force", "results", "events"}
+        if kind not in allowed:
             raise ValueError("未知记录类型")
+        if self.compact:
+            from .peak_drift_capture import project
+            value = project(value)
         # Serialize before ownership transfers, so later UI/state mutation cannot alter evidence.
         line = json.dumps(clean(value), ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
         try:
@@ -66,6 +79,15 @@ class SessionWriter:
                     if item is None:
                         break
                     kind, line, frame_id = item
+                    if kind == "_checkpoint":
+                        # Ordered with raw records, but never performs file IO
+                        # in either device reader or the experiment lock.
+                        import os
+                        for handle in handles.values():
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        self.last_checkpoint = line
+                        continue
                     if kind not in handles:
                         handles[kind] = (self.path / (kind + ".jsonl")).open("x", encoding="utf-8", newline="\n")
                     handles[kind].write(line)
@@ -83,9 +105,32 @@ class SessionWriter:
                     handle.flush()
                     import os
                     os.fsync(handle.fileno())
-                    handle.close()
                 except OSError as exc:
                     self.error = "数据落盘失败：" + str(exc)
+                finally:
+                    try:
+                        handle.close()
+                    except OSError as exc:
+                        self.error = "关闭数据文件失败：" + str(exc)
+
+    def request_checkpoint(self, token):
+        """Queue a durable boundary; readers must poll its ACK without waiting."""
+        if not isinstance(token, str) or not token or len(token) > 200:
+            raise ValueError("本轮保存检查点编号无效")
+        if self.error or self.closed:
+            raise RuntimeError(self.error or "会话已关闭，不能提交本轮保存检查点")
+        if token == self.checkpoint_requested:
+            return
+        try:
+            self.queue.put_nowait(("_checkpoint", token, None))
+            self.checkpoint_requested = token
+        except queue.Full:
+            self.overflow += 1
+            self.error = "原始数据写盘队列已满；本轮保存尚未确认"
+            raise RuntimeError(self.error)
+
+    def checkpoint_ready(self, token):
+        return not self.error and bool(token) and self.last_checkpoint == token
 
     def close(self, final: dict):
         if self.closed:
@@ -100,6 +145,9 @@ class SessionWriter:
         self.thread.join(timeout=15)
         if self.thread.is_alive():
             self.error = "写盘线程尚未停止，不能宣布保存完成"
+        if self.compact:
+            from .peak_drift_capture import project
+            final = project(final)
         manifest = {**self.metadata, "ended_utc": datetime.now(timezone.utc).isoformat(),
                     "counts": self.counts, "accepted_records": self.accepted, "overflow": self.overflow,
                     "complete": not self.error and not final.get("error") and not self.thread.is_alive() and self.queue.empty(),
@@ -116,4 +164,5 @@ class SessionWriter:
     def status(self):
         return {"path": str(self.path), "counts": dict(self.counts), "queue_depth": self.queue.qsize(),
                 "error": self.error, "overflow": self.overflow, "closed": self.closed,
+                "last_checkpoint": self.last_checkpoint, "checkpoint_requested": self.checkpoint_requested,
                 "last_saved_frame_ids": dict(self.last_saved_frame_ids)}

@@ -14,10 +14,11 @@ import time
 import uuid
 
 from .storage import clean
+from .capture_setup import setup_allows_trial
 from .tracking import ALGORITHM_VERSION
 
 
-_METHOD_LABELS = {"linear": "加权最小二乘", "mlp": "小型 MLP"}
+_METHOD_LABELS = {"linear": "加权最小二乘", "mlp": "小型 MLP", "spectral_gru": "全谱 MLP＋GRU（六维力）", "drift_gru": "寻峰漂移 MLP＋GRU（六维力）"}
 
 
 def _id(value):
@@ -221,6 +222,8 @@ def load_rows(userdata, session_ids, progress=None):
         if manifest.get("kind") != "9fbg_calibration_experiment_v1" or manifest.get("complete") is not True:
             raise ValueError("实验记录未完整结束，不能用于拟合：" + session_id)
         settings = manifest["settings"]
+        if settings.get("acquisition_protocol") in {"timed_wrench_v1", "force_target_wrench_v1"}:
+            raise ValueError("六维全谱会话只用于 spectral_gru，不能进入旧九峰训练或补算")
         signature = _physical_definition(settings)
         if physical is None:
             physical = signature
@@ -232,7 +235,7 @@ def load_rows(userdata, session_ids, progress=None):
             training_conditions = conditions
         elif conditions != training_conditions:
             raise _incompatible_sources("不能混合不同装夹方式或温度环境条件的会话；留空须与留空一致", session_id, settings, session_ids[0], first_settings)
-        if not settings.get("force_direction_confirmed") or not settings.get("coordinates_confirmed"):
+        if not setup_allows_trial(settings):
             raise ValueError("会话缺少法向力方向或点位确认")
         def notify(value):
             if progress:
@@ -302,6 +305,23 @@ def load_rows(userdata, session_ids, progress=None):
                   "feature_coverage_note": "离线逐个补算原始光谱，沿用保存的固定身份窗口、算法配置和本次基线；原始与在线结果均不覆盖。仅质量有效且完整试次帧进入训练表。"}
 
 
+def _validate_spectral_sources(userdata, bundle):
+    from .peak_drift_data import is_compact, RECORDING_SCHEMA
+    for source in bundle["acquisition_provenance"]["sources"]:
+        directory = _archived_source_path(userdata, _id(source["session_id"]))
+        if directory is None:
+            continue
+        path = directory / "manifest.json"
+        if not path.is_file() or _digest_file(path) != source["manifest_sha256"]:
+            raise ValueError("全谱模型来源清单哈希不匹配")
+        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+        compact = is_compact(manifest)
+        if (manifest.get("kind") != "9fbg_calibration_experiment_v1" or manifest.get("complete") is not True or
+                (source.get("recording_schema") == RECORDING_SCHEMA) != compact or
+                any(manifest.get("files", {}).get(name) != digest for name, digest in source["files"].items())):
+            raise ValueError("全谱模型来源不是对应的完整会话")
+
+
 class AnalysisController:
     def __init__(self, userdata):
         self.userdata = Path(userdata)
@@ -309,6 +329,9 @@ class AnalysisController:
         self.busy, self.error, self.report = False, None, None
         self.job_id = self.report_id = self.model_id = None
         self.bundle = None
+        self.inference_active = False
+        self._inference_stopped = False
+        self._inference_generation = 0
         self.job_progress = {}
         self.training = {"job_id": None, "busy": False, "status": "idle", "progress_percent": 0,
                          "stage": "等待训练", "method": None, "method_label": None, "error": None,
@@ -317,9 +340,99 @@ class AnalysisController:
         self.truth_zero = {"ready": False, "count": 0, "reason": "尚未建立独立测试六轴零点"}
         self.test_reference = {"ready": False, "pending": False, "reason": "请确认当前无接触并建立独立测试光学参考"}
         self._zero_samples, self._zero_seen = [], set()
+        from .spectral_runtime import SpectralRuntime
+        self.spectral_runtime = SpectralRuntime()
+        self.spectral_training = None
+        self._spectral_starting = False
+        self._training_snapshot_manager = None
+        self._training_snapshot_revision = None
+
+    def is_spectral(self):
+        return bool(self.bundle and self.bundle.get("model_kind") == "spectral_gru")
+
+    def _refresh_spectral_training(self):
+        with self.lock:
+            if self._spectral_starting:
+                return
+            manager = self.spectral_training
+            if manager is None or self.training.get("method") not in {"spectral_gru", "drift_gru"}:
+                return
+            revision = self._training_snapshot_revision if self._training_snapshot_manager is manager else None
+        # The manager can copy a large final evaluation. It must not hold the
+        # analysis lock also used by the six-axis receiving thread.
+        if hasattr(manager, "status_if_changed"):
+            revision, status = manager.status_if_changed(revision)
+            if status is None:
+                return
+        else:
+            revision, status = None, manager.status()
+        training, progress = deepcopy(status), deepcopy(status)
+        with self.lock:
+            if self._spectral_starting or self.spectral_training is not manager or self.training.get("method") not in {"spectral_gru", "drift_gru"}:
+                return
+            if (self._training_snapshot_manager is manager and revision is not None
+                    and self._training_snapshot_revision is not None and revision < self._training_snapshot_revision):
+                return
+            self.training, self.job_progress = training, progress
+            self.busy = bool(status.get("busy", status.get("active", False)))
+            self.error = status.get("error")
+            self._training_snapshot_manager, self._training_snapshot_revision = manager, revision
+
+    def training_control(self, action, reason="user"):
+        if isinstance(reason, str) and reason.startswith("acquisition:"):
+            reason = "acquisition"
+        if self.spectral_training is None or self.training.get("method") not in {"spectral_gru", "drift_gru"}:
+            if reason == "acquisition":
+                return deepcopy(self.training)
+            raise ValueError("仅 MLP＋GRU 任务支持暂停、继续或取消")
+        if action not in {"pause", "resume", "cancel"}:
+            raise ValueError("未知训练控制操作")
+        if action == "cancel":
+            self.spectral_training.cancel()
+        else:
+            getattr(self.spectral_training, action)(reason)
+        self._refresh_spectral_training()
+        return deepcopy(self.training)
+
+    def close(self):
+        if self.spectral_training is not None:
+            self.spectral_training.close()
+        self.spectral_runtime.close()
+        self._refresh_spectral_training()
+
+    def on_spectrum(self, frame):
+        self.spectral_runtime.submit(frame)
+
+    def on_result(self, frame, annotation=None):
+        self.spectral_runtime.submit_result(frame, annotation)
+
+    def stop_inference(self):
+        with self.lock:
+            self.inference_active = False
+            self._inference_stopped = True
+            self._inference_generation += 1
+            self.spectral_runtime.stop_inference()
+            self._reset_truth_zero()
+            reason = "推理已结束，请重新载入模型并明确确认无接触后建立新参考"
+            self.test_reference["reason"] = self.truth_zero["reason"] = reason
+
+    def require_reference_enabled(self):
+        with self.lock:
+            if self._inference_stopped and self.bundle is not None:
+                raise ValueError("推理已结束，请先重新载入模型，再确认无接触并建立新参考")
+
+    def _inactive_prediction(self):
+        return {"valid": False, "status": "已结束" if self._inference_stopped else "尚未开始",
+                "point_id": None, "force_N": None, "raw_force_N": None,
+                "truth_force_N": None, "error_N": None, "wrench_pred": None,
+                "wrench_truth": None, "wrench_error": None, "force_norm_N": None,
+                "contact": False, "comparison_ready": False, "formal_ready": False,
+                "reason": "推理已结束，请重新载入模型并明确确认无接触后建立新参考" if self._inference_stopped
+                          else "请载入模型，并明确确认无接触后建立独立推理参考"}
 
     def request_truth_zero(self, context):
         with self.lock:
+            self.require_reference_enabled()
             force = context.get("force") or {}
             tracker, frame = context.get("tracker") or {}, context.get("frame") or {}
             requested_ns = time.perf_counter_ns()
@@ -334,6 +447,8 @@ class AnalysisController:
                                "requested_ns": requested_ns, "epoch": force.get("stream_epoch"),
                                "force_sign": (self.bundle or {}).get("acquisition_provenance", {}).get("physical_definition", {}).get("force_sign", -1), "reason": "收集无载六轴零点" if context.get("force_connected") else "未连接 PX6D；仅建立 FBG 测试参考"}
             self._zero_samples, self._zero_seen = [], set()
+            if self.is_spectral():
+                self.spectral_runtime.request_reference(True, frame.get("stream_epoch"), requested_ns=requested_ns)
 
     def on_force(self, frame):
         with self.lock:
@@ -354,14 +469,45 @@ class AnalysisController:
             if frame.get("axes") != ["Fx", "Fy", "Fz", "Mx", "My", "Mz"] or frame.get("units") != ["N", "N", "N", "N·m", "N·m", "N·m"]:
                 return
             self._zero_seen.add(key)
-            self._zero_samples.append((stamp, list(values)))
+            self._zero_samples.append((stamp, list(values), frame["frame_id"]))
             zero["count"] = min(12, len(self._zero_samples))
             if len(self._zero_samples) >= 12 and stamp - self._zero_samples[0][0] >= 400_000_000:
                 sample = [self._zero_samples[round(i * (len(self._zero_samples)-1) / 11)] for i in range(12)]
-                zero.update(ready=True, pending=False, offsets=[statistics.median(row[1][axis] for row in sample) for axis in range(6)], reason="六轴无载测试零点已建立")
+                offsets = [statistics.median(row[1][axis] for row in sample) for axis in range(6)]
+                zero.update(ready=True, pending=False, offsets=offsets,
+                    noise_mad=[statistics.median(abs(row[1][axis] - offsets[axis]) for row in sample) for axis in range(6)],
+                    source_frame_ids=[row[2] for row in sample], source_timestamps_ns=[row[0] for row in sample],
+                    source_values=[deepcopy(row[1]) for row in sample], effective_ns=stamp,
+                    trigger="operator_unloaded_confirmation", zero_id="Z" + uuid.uuid4().hex,
+                    reason="六轴无载测试零点已建立")
 
     def models(self):
         result = []
+        from .model_history import model_path
+        from .spectral_model import validate_metadata
+        spectral = self.userdata / "spectral_models"
+        if spectral.is_dir() and not spectral.is_symlink() and not (hasattr(spectral, "is_junction") and spectral.is_junction()):
+            for directory in spectral.iterdir():
+                try:
+                    if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
+                        continue
+                    model_path(self.userdata, directory.name)
+                    file = directory / "metadata.json"
+                    if not file.is_file() or file.is_symlink() or file.stat().st_size > 32 * 1024 * 1024:
+                        continue
+                    data = validate_metadata(json.loads(file.read_text(encoding="utf-8")))
+                    _validate_spectral_sources(self.userdata, data)
+                    sources = _model_sources(self.userdata, data)
+                    created = _model_time(data.get("created_utc"))
+                    result.append({"model_id": directory.name, "model_kind": "spectral_gru", "method": data.get("method", "spectral_gru"),
+                        "input_kind": data.get("input_kind", "delta_S"),
+                        "method_label": _METHOD_LABELS[data.get("method", "spectral_gru")], "created_utc": data.get("created_utc"),
+                        "created_local_minute": created.astimezone().strftime("%Y-%m-%d %H:%M") if created else None,
+                        "formal_ready": False, "research_only": True, "point_ids": data["trained_point_ids"],
+                        "source_session_ids": [source["session_id"] for source in sources], "source_records": sources,
+                        "model_sha256": data["model_sha256"], "scope": "trained_points_spectral_research_only"})
+                except (ValueError, OSError, TypeError, KeyError):
+                    continue
         for directory, prefix, kind in (("models", "M", "full"), ("pilot_models", "P", "pilot")):
             path = self.userdata / directory
             if not path.is_dir():
@@ -370,11 +516,15 @@ class AnalysisController:
                 try:
                     if file.stat().st_size > 32 * 1024 * 1024:
                         continue
+                    model_path(self.userdata, file.stem)
                     data = json.loads(file.read_text(encoding="utf-8"))
                     if not isinstance(data, dict):
                         continue
                     if kind == "pilot":
                         _validate_live_pilot(data, self.userdata)
+                    else:
+                        from .inversion import validate_bundle
+                        validate_bundle(data)
                     sources = _model_sources(self.userdata, data)
                     ids = list(dict.fromkeys(record["data_id"] for record in sources if record["data_id"]))
                     created = _model_time(data.get("created_utc"))
@@ -399,16 +549,41 @@ class AnalysisController:
                 except (ValueError, OSError, TypeError, KeyError, AttributeError):
                     continue
         result.sort(key=lambda row: (_model_time(row["created_utc"]) or datetime.min.replace(tzinfo=timezone.utc), row["model_id"]), reverse=True)
-        return result[:100]
+        return result
 
     def load(self, model_id):
         from .inversion import validate_bundle
+        from .model_history import model_path
+        self._refresh_spectral_training()
         with self.lock:
             if self.busy:
                 raise ValueError("模型处理正在运行，请等待完成")
-        model_id = _id(model_id)
+        checked = model_path(self.userdata, model_id)
+        # Explicit registry branch: a spectral directory never enters a legacy validator.
+        spectral_path = checked
+        if model_id.startswith("S"):
+            root = self.userdata / "spectral_models"
+            if root.is_symlink() or hasattr(root, "is_junction") and root.is_junction() or root.resolve().parent != self.userdata.resolve():
+                raise ValueError("全谱模型目录超出允许位置")
+            from .spectral_model import load_bundle
+            bundle, model = load_bundle(spectral_path)
+            if bundle.get("model_id") != model_id:
+                raise ValueError("全谱模型标识与保存目录不一致")
+            _validate_spectral_sources(self.userdata, bundle)
+            with self.lock:
+                if self.busy:
+                    raise ValueError("模型处理正在运行，请等待完成")
+                self.spectral_runtime.apply(bundle, model)
+                self.model_id, self.bundle, self.error = model_id, bundle, None
+                self.inference_active, self._inference_stopped = True, False
+                self._inference_generation += 1
+                self._reset_truth_zero()
+            return {"model_id": model_id, "model_kind": "spectral_gru", "point_ids": bundle["trained_point_ids"],
+                    "method": bundle.get("method", "spectral_gru"), "input_kind": bundle.get("input_kind", "delta_S"),
+                    "method_label": _METHOD_LABELS[bundle.get("method", "spectral_gru")],
+                    "research_only": True, "formal_ready": False}
         kind = "pilot" if model_id.startswith("P") else "full"
-        file = self.userdata / ("pilot_models" if kind == "pilot" else "models") / (model_id + ".json")
+        file = checked
         if not file.is_file() or file.stat().st_size > 32 * 1024 * 1024:
             raise ValueError("模型不存在或文件大小不合要求")
         bundle = json.loads(file.read_text(encoding="utf-8"))
@@ -422,11 +597,25 @@ class AnalysisController:
             if self.busy:
                 raise ValueError("模型处理正在运行，请等待完成")
             self.model_id, self.bundle, self.error = model_id, bundle, None
+            self.inference_active, self._inference_stopped = True, False
+            self._inference_generation += 1
+            self.spectral_runtime.unload()
             self._reset_truth_zero()
         return {"model_id": model_id, "model_kind": kind, "point_ids": deepcopy(bundle.get("point_ids", [])),
                 "method": bundle.get("primary_method", "linear"),
                 "method_label": _METHOD_LABELS.get(bundle.get("primary_method", "linear"), bundle.get("primary_method")),
                 "research_only": True, "formal_ready": False}
+
+    def forget_models(self, model_ids):
+        with self.lock:
+            if self.model_id not in model_ids:
+                return False
+            if self.inference_active:
+                raise ValueError("当前模型正在推理，请先结束推理")
+            self.spectral_runtime.unload()
+            self.stop_inference()
+            self.model_id = self.bundle = None
+            return True
 
     def _reset_truth_zero(self):
         self.truth_zero = {"ready": False, "pending": False, "count": 0,
@@ -457,6 +646,7 @@ class AnalysisController:
                              reason="本次明确无载后的独立测试光学参考已就绪")
 
     def start_job(self, kind, session_ids, options=None):
+        self._refresh_spectral_training()
         if kind not in {"preview", "build", "evaluate", "pilot", "train"}:
             raise ValueError("未知离线分析操作")
         if not isinstance(session_ids, list) or not session_ids:
@@ -466,6 +656,36 @@ class AnalysisController:
         if options is not None and not isinstance(options, dict):
             raise ValueError("训练与分析参数必须为对象")
         options = deepcopy(options or {})
+        if kind == "train" and not isinstance(options.get("method", "linear"), str):
+            raise ValueError("训练方法必须为有效的方法名称")
+        if kind == "train" and options.get("method") not in {"spectral_gru", "drift_gru"} and (
+                "training_mode" in options or "base_model_id" in options):
+            raise ValueError("继承权重微调仅支持 MLP＋GRU 模型")
+        if options.get("allow_synthetic") or options.get("allow_synthetic_diagnostics") or options.get("formal_ready") or options.get("drift_ranges_confirmed"):
+            raise ValueError("不能通过界面参数替代真实算法比较、漂移证据或正式训练门")
+        if kind == "train" and options.get("method") in {"spectral_gru", "drift_gru"}:
+            from .spectral_training import SpectralTrainingManager
+            with self.lock:
+                if self.busy:
+                    raise ValueError("已有模型处理任务，请等待完成")
+                if self.spectral_training is None:
+                    self.spectral_training = SpectralTrainingManager(self.userdata)
+                # Reserve the analysis slot before releasing the realtime lock.
+                # Parent/source preflight and spawning can perform disk IO.
+                self._spectral_starting = self.busy = True
+            try:
+                result = self.spectral_training.start(deepcopy(session_ids), options)
+            except Exception:
+                with self.lock:
+                    self._spectral_starting = self.busy = False
+                raise
+            with self.lock:
+                self.training = deepcopy(self.spectral_training.status())
+                self.busy = bool(self.training.get("busy", self.training.get("active", True)))
+                self.job_id, self.error = self.training.get("job_id"), None
+                self.job_progress = deepcopy(self.training)
+                self._spectral_starting = False
+                return {"busy": self.busy, "job_id": self.job_id, "training": deepcopy(self.training)}
         if options.get("allow_synthetic") or options.get("allow_synthetic_diagnostics") or options.get("formal_ready") or options.get("drift_ranges_confirmed"):
             raise ValueError("不能通过界面参数替代真实算法比较、漂移证据或正式训练门")
         if kind in {"pilot", "train"}:
@@ -563,8 +783,12 @@ class AnalysisController:
                     json.dump(clean(bundle), stream, ensure_ascii=False, allow_nan=False)
                 report = evaluate_models(bundle, rows)
                 with self.lock:
-                    self.bundle, self.model_id = bundle, model_id
-                    self._reset_truth_zero()
+                    if not self._inference_stopped:
+                        self.bundle, self.model_id = bundle, model_id
+                        self.inference_active = False
+                        self._inference_generation += 1
+                        self.spectral_runtime.stop_inference()
+                        self._reset_truth_zero()
             elif kind in {"pilot", "train"}:
                 from .pilot import fit_pilot, save_pilot_model
                 result = fit_pilot(rows, options, progress=lambda value: self._training_progress(value, "fit")) if kind == "train" else fit_pilot(rows, options)
@@ -593,7 +817,8 @@ class AnalysisController:
                 report = evaluate_models(self.bundle, rows)
             report.update(kind=kind, provenance=provenance, formal_ready=False,
                           created_utc=datetime.now(timezone.utc).isoformat(),
-                          aligned_table=str(output / "aligned_features.jsonl"), model_id=None if kind in {"pilot", "train"} else self.model_id)
+                          aligned_table=str(output / "aligned_features.jsonl"),
+                          model_id=None if kind in {"pilot", "train"} else model_id if kind == "build" else self.model_id)
             (output / "report.json").write_text(json.dumps(clean(report), ensure_ascii=False, allow_nan=False, indent=2), encoding="utf-8")
             if kind == "train":
                 pending_model.replace(model_path)
@@ -601,7 +826,7 @@ class AnalysisController:
             with self.lock:
                 if kind == "train":
                     created = _model_time(model["created_utc"])
-                    self.training.update(busy=False, status="completed", progress_percent=100, stage="训练模型已保存，请手动载入后进行实机验证",
+                    self.training.update(busy=False, status="completed", progress_percent=100, stage="训练模型已保存，请手动载入后进行模型推理",
                                          model_id=pilot_id, point_ids=deepcopy(model["point_ids"]), created_utc=model["created_utc"],
                                          created_local_minute=created.astimezone().strftime("%Y-%m-%d %H:%M"))
                     self.job_progress = deepcopy(self.training)
@@ -679,6 +904,7 @@ class AnalysisController:
             return deepcopy(self.report or {"reason": "尚无分析报告"})
 
     def snapshot(self, tracker=None, force=None, sync=None, experiment=None, *, source_kind=None):
+        self._refresh_spectral_training()
         from .inversion import predict
         from .pilot import MODEL_SCHEMA as PILOT_SCHEMA, predict_pilot
         tracker, experiment = tracker or {}, experiment or {}
@@ -688,28 +914,53 @@ class AnalysisController:
                        set(by_id) == {f"FBG{i}" for i in range(1, 10)} and
                        not tracker.get("display_stale") and not tracker.get("reference_pending") and
                        all(row.get("valid") and not row.get("stale") and type(row.get("drift_nm")) in (int, float) and math.isfinite(row["drift_nm"]) for row in by_id.values()))
+        spectral_state = None
         with self.lock:
-            bundle, zero = self.bundle, deepcopy(self.truth_zero)
-            if (zero.get("ready") or zero.get("pending")) and (not force or force.get("stale") or force.get("stream_epoch") != zero.get("epoch")):
-                zero.update(ready=False, pending=False, offsets=None, reason="PX6D 已断开、过期或时段改变；测试真值零点需重新确认")
-                self.truth_zero = deepcopy(zero)
-                self._zero_samples, self._zero_seen = [], set()
-            self._update_test_reference(tracker, source_kind, fresh_peaks)
-            test_reference = deepcopy(self.test_reference)
-            base = {"busy": self.busy, "error": self.error, "job_id": self.job_id,
+            if self.is_spectral():
+                spectral_state = self._spectral_snapshot(force, experiment, source_kind)
+                spectral_generation = self._inference_generation
+            else:
+                bundle, zero = self.bundle, deepcopy(self.truth_zero)
+                inference_active, generation = self.inference_active, self._inference_generation
+                if (zero.get("ready") or zero.get("pending")) and (not force or force.get("stale") or force.get("stream_epoch") != zero.get("epoch")):
+                    zero.update(ready=False, pending=False, offsets=None, reason="PX6D 已断开、过期或时段改变；测试真值零点需重新确认")
+                    self.truth_zero = deepcopy(zero)
+                    self._zero_samples, self._zero_seen = [], set()
+                self._update_test_reference(tracker, source_kind, fresh_peaks)
+                test_reference = deepcopy(self.test_reference)
+                base = {"busy": self.busy, "error": self.error, "job_id": self.job_id,
                     "report_id": self.report_id, "model_id": self.model_id, "formal_ready": False,
                     "model_kind": ("pilot" if bundle.get("schema") == PILOT_SCHEMA else "full") if bundle else None,
                     "trained_point_ids": deepcopy(bundle.get("point_ids", [point["id"] for point in bundle.get("grid", {}).get("point_grid", [])])) if bundle else [],
                     "model_sha256": bundle.get("model_sha256", bundle.get("bundle_sha256")) if bundle else None,
-                    "job_progress": deepcopy(self.job_progress),
-                    "training": deepcopy(self.training),
+                    "job_progress": dict(self.job_progress),
+                    "training": dict(self.training), "inference_active": inference_active,
                     "model_definition": deepcopy((bundle or {}).get("acquisition_provenance", {}).get("physical_definition")),
                     "report": {key: deepcopy(self.report[key]) for key in ("kind", "formal_ready", "quality_summary", "model_id", "pilot_model_id", "summary", "scope") if self.report and key in self.report},
-                    "truth_zero": zero, "test_reference": test_reference}
+                        "truth_zero": zero, "test_reference": test_reference}
+        if spectral_state is not None:
+            # A published bundle and nested training values are replaced, never
+            # edited in place. Copy/normalise the large reporting payload only
+            # after releasing the lock also acquired by the force reader.
+            runtime_generation = spectral_state.pop("_runtime_generation")
+            result = clean(spectral_state)
+            with self.lock, self.spectral_runtime.lock:
+                if (spectral_generation != self._inference_generation
+                        or runtime_generation != self.spectral_runtime.generation):
+                    result["inference_active"] = self.inference_active
+                    result["prediction"] = self._inactive_prediction()
+                    if self.inference_active:
+                        result["prediction"].update(status="无效", reason="模型、参考或推理状态已改变，请读取最新状态")
+                    result["test_reference"].update(ready=False, pending=False,
+                        reason="模型、参考或推理状态已改变，请读取最新状态")
+                    result["truth_zero"] = deepcopy(self.truth_zero)
+            return result
         prediction = {"status": "尚无模型", "point_id": None, "force_N": None, "truth_force_N": None,
                       "error_N": None, "comparison_ready": False,
-                      "reason": "请先在训练页训练模型，再选择并载入模型进行实机验证"}
-        if bundle:
+                      "reason": "请先在训练页训练模型，再选择并载入模型进行模型推理"}
+        if not inference_active and (bundle or self._inference_stopped):
+            prediction = self._inactive_prediction()
+        if bundle and inference_active:
             baseline = experiment.get("baseline") or {}
             experiment_reference = bool(experiment.get("running") and baseline.get("ready") and
                                         baseline.get("reference_version") == tracker.get("reference_version") and
@@ -765,4 +1016,54 @@ class AnalysisController:
                                                    and math.isfinite(prediction["truth_force_N"])
                                                    and prediction["truth_force_N"] > 0.05
                                                    and prediction.get("status") in {"有效估计", "定位不确定", "超范围", "无接触"})
-        return clean({**base, "prediction": prediction})
+        with self.lock:
+            if generation != self._inference_generation:
+                prediction = self._inactive_prediction()
+                if self.inference_active:
+                    prediction.update(status="无效", reason="模型或推理状态已改变，请读取最新状态")
+                base.update(inference_active=self.inference_active, truth_zero=deepcopy(self.truth_zero),
+                            test_reference=deepcopy(self.test_reference))
+        result = clean({**base, "prediction": prediction})
+        with self.lock:
+            if generation != self._inference_generation:
+                result["inference_active"] = self.inference_active
+                result["prediction"] = self._inactive_prediction()
+                if self.inference_active:
+                    result["prediction"].update(status="无效", reason="模型或推理状态已改变，请读取最新状态")
+                result["truth_zero"] = deepcopy(self.truth_zero)
+                result["test_reference"] = deepcopy(self.test_reference)
+        return result
+
+    def _spectral_snapshot(self, force, experiment, source_kind):
+        # Reading cached inference cannot append a frame or invoke the network.
+        with self.lock:
+            runtime = self.spectral_runtime.snapshot()
+            zero = deepcopy(self.truth_zero)
+            if (zero.get("ready") or zero.get("pending")) and (not force or force.get("stale") or force.get("stream_epoch") != zero.get("epoch")):
+                zero.update(ready=False, pending=False, offsets=None, reason="PX6D 已断开或时段改变，请重新确认测试零点")
+                self.truth_zero = deepcopy(zero)
+            reference = runtime["reference"]
+            requested = self.test_reference.get("requested_ns")
+            independent_ready = bool(reference and not experiment.get("running") and source_kind == "hardware"
+                and type(requested) is int and reference.get("requested_ns") == requested
+                and reference.get("trigger") == "operator_unloaded_confirmation"
+                and reference.get("stream_epoch") == self.test_reference.get("epoch"))
+            self.test_reference.update(ready=independent_ready,
+                pending=bool(runtime["reference_pending"] and type(requested) is int and not experiment.get("running")),
+                reference_id=reference.get("reference_id") if reference else None,
+                count=runtime["reference_count"], reason=("独立九路漂移无载参考已就绪" if self.spectral_runtime.is_drift() else "独立全谱无载参考已就绪") if independent_ready else
+                    "推理已结束，请重新载入模型并明确确认无接触后建立新参考" if self._inference_stopped else
+                    ("请明确确认无接触并建立本次独立九路漂移参考" if self.spectral_runtime.is_drift() else "请明确确认无接触并建立本次独立全谱参考"))
+            bundle = self.bundle
+            return {"_runtime_generation": runtime["generation"],
+                "busy": self.busy, "error": self.error, "job_id": self.job_id,
+                "report_id": self.report_id, "model_id": self.model_id, "formal_ready": False,
+                "model_kind": "spectral_gru", "method": bundle.get("method", "spectral_gru"),
+                "input_kind": bundle.get("input_kind", "delta_S"),
+                "model_sha256": bundle["model_sha256"], "inference_active": self.inference_active,
+                "trained_point_ids": list(bundle["trained_point_ids"]), "training": dict(self.training),
+                "job_progress": dict(self.job_progress), "truth_zero": zero,
+                "test_reference": deepcopy(self.test_reference), "spectral_reference": reference,
+                "model_definition": bundle.get("acquisition_provenance", {}).get("physical_definition"),
+                "report": bundle.get("evaluation", {}), "inference_metrics": runtime["metrics"],
+                "prediction": runtime["prediction"]}

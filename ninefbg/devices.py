@@ -618,6 +618,7 @@ class PX6DSource:
         self.port_identity = None
         self.last_failed_packet = None
         self.last_response_address = None
+        self.last_read_timing = None
 
     def _find_port(self):
         from serial.tools import list_ports
@@ -650,6 +651,7 @@ class PX6DSource:
             self.metrics = _Metrics()
             self.stream_epoch = uuid.uuid4().hex
             self._next_poll = 0
+            self.last_read_timing = None
         except Exception:
             self.close()
             raise
@@ -682,18 +684,38 @@ class PX6DSource:
             raise ValueError("PX6D 轮询频率必须为 1～100 Hz。")
         self._next_poll = now + 1 / poll_hz
         start_ns = time.perf_counter_ns()
+        read_timing = {"schema": "px6d_read_timing_v1", "read_start_ns": start_ns}
+        stage = "input_reset"
         try:
             device_id = self.config.get("device_id", 127)
             # A timeout invalidates the pending response; never reuse it as a
             # new request's current response on the next call.
+            read_timing["input_reset_start_ns"] = time.perf_counter_ns()
             self.port.reset_input_buffer()
             self._buffer.clear()
-            self.port.write(command_packet(0x05, device_id=device_id))
-            self.port.flush()
+            read_timing["input_reset_end_ns"] = time.perf_counter_ns()
+            read_timing["input_reset_ms"] = (read_timing["input_reset_end_ns"] - read_timing["input_reset_start_ns"]) / 1e6
+            request = command_packet(0x05, device_id=device_id)
+            stage = "write"
+            read_timing["write_start_ns"] = time.perf_counter_ns()
+            written = self.port.write(request)
+            read_timing["write_end_ns"] = time.perf_counter_ns()
+            read_timing["write_ms"] = (read_timing["write_end_ns"] - read_timing["write_start_ns"]) / 1e6
+            # open() uses a positive write_timeout: serialwin32.write waits for
+            # completion and reports the transferred length. Its flush instead
+            # polls out_waiting with 50 ms sleeps, delaying response reception.
+            if type(written) is not int or written != len(request):
+                raise OSError("PX6D 查询命令未完整发送（" + str(written) + "/" + str(len(request)) + " 字节）。")
+            stage = "response"
+            read_timing["response_start_ns"] = time.perf_counter_ns()
             raw = self._packet(29, float(self.config.get("read_timeout_sec", .2)))
             received_ns = time.perf_counter_ns()
+            read_timing.update(response_end_ns=received_ns,
+                               response_ms=(received_ns-read_timing["response_start_ns"])/1e6,
+                               roundtrip_ms=(received_ns-start_ns)/1e6)
             if raw is None:
                 raise TimeoutError("PX6D 当前帧读取超时。")
+            stage = "validation"
             try:
                 # Preserve the prior working native USB reader's contract:
                 # the response's address is exposed, not assumed to echo the
@@ -705,14 +727,19 @@ class PX6DSource:
                 raise
             self.last_response_address = raw[2]
             self.metrics.mark(values, received_ns)
-            return {"force_values": values, "axes": list(AXES), "units": ["N", "N", "N", "N·m", "N·m", "N·m"], "frame_id": self.metrics.received, "local_receive_id": self.metrics.received, "frame_id_source": "local_receive_sequence", "device_sequence": None, "device_timestamp_raw": None, "host_rx_monotonic_ns": received_ns, "utc_timestamp": utc_now(), "read_start_ns": start_ns, "read_end_ns": received_ns, "roundtrip_ms": (received_ns-start_ns)/1e6, "time_quality": "host_rx_approx", "timestamp_source": "host_receive_monotonic", "stream_epoch": self.stream_epoch, "source_kind": "hardware", "raw_packet_hex": raw.hex(), "request_device_id": device_id, "response_device_id": raw[2], "response_address_verified": bool(self.config.get("verify_response_device_id", False)), "preprocessing": {"software_tare_applied": False, "filter_applied": False, "hardware_zero_command_sent": False}}
+            read_timing["status"] = "valid"
+            self.last_read_timing = dict(read_timing)
+            return {"force_values": values, "axes": list(AXES), "units": ["N", "N", "N", "N·m", "N·m", "N·m"], "frame_id": self.metrics.received, "local_receive_id": self.metrics.received, "frame_id_source": "local_receive_sequence", "device_sequence": None, "device_timestamp_raw": None, "host_rx_monotonic_ns": received_ns, "utc_timestamp": utc_now(), "read_start_ns": start_ns, "read_end_ns": received_ns, "roundtrip_ms": (received_ns-start_ns)/1e6, "read_timing": dict(read_timing), "time_quality": "host_rx_approx", "timestamp_source": "host_receive_monotonic", "stream_epoch": self.stream_epoch, "source_kind": "hardware", "raw_packet_hex": raw.hex(), "request_device_id": device_id, "response_device_id": raw[2], "response_address_verified": bool(self.config.get("verify_response_device_id", False)), "preprocessing": {"software_tare_applied": False, "filter_applied": False, "hardware_zero_command_sent": False}}
         except (ValueError, TimeoutError, OSError) as exc:
+            read_timing.update(status="failed", failed_stage=stage, error=str(exc))
+            self.last_read_timing = dict(read_timing)
             self.metrics.errors += 1
             self.metrics.last_error = str(exc)
             raise
 
     def diagnostics(self):
-        return {**self.metrics.report(), "connected": self.port is not None and self.port.is_open, "stream_epoch": self.stream_epoch, "port_identity": self.port_identity, "firmware": self.firmware, "hardware_timestamp_available": False, "queue_backlog": 0, "last_failed_packet": self.last_failed_packet, "last_failed_packet_hex": (self.last_failed_packet or {}).get("raw_packet_hex"), "last_response_address": self.last_response_address, "response_address_verification": "与既有工作USB协议一致，默认不假定响应地址回显请求；保留响应地址，CRC强制校验"}
+        read_timing = self.last_read_timing
+        return {**self.metrics.report(), "connected": self.port is not None and self.port.is_open, "stream_epoch": self.stream_epoch, "port_identity": self.port_identity, "firmware": self.firmware, "hardware_timestamp_available": False, "queue_backlog": 0, "last_failed_packet": self.last_failed_packet, "last_failed_packet_hex": (self.last_failed_packet or {}).get("raw_packet_hex"), "last_response_address": self.last_response_address, "read_timing": dict(read_timing) if read_timing is not None else None, "response_address_verification": "与既有工作USB协议一致，默认不假定响应地址回显请求；保留响应地址，CRC强制校验"}
 
     def close(self):
         port, self.port = self.port, None

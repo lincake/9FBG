@@ -191,7 +191,7 @@ def test_px6d_invalid_raw_packet_is_retained_in_diagnostics():
     class FakePort:
         is_open = True
         def reset_input_buffer(self): pass
-        def write(self, data): pass
+        def write(self, data): return len(data)
         def flush(self): pass
     source = PX6DSource({"poll_hz": 50, "device_id": 127})
     source.port = FakePort()
@@ -221,7 +221,9 @@ def test_px6d_frame_returns_acquisition_interval_and_raw_packet():
     class FakePort:
         is_open = True
         def reset_input_buffer(self): pass
-        def write(self, data): assert data == command_packet(5)
+        def write(self, data):
+            assert data == command_packet(5)
+            return len(data)
         def flush(self): pass
     source = PX6DSource({"poll_hz": 50, "device_id": 127})
     source.port = FakePort()

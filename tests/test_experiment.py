@@ -72,6 +72,25 @@ def rows(manager, name):
     return [json.loads(line) for line in (manager.writer.path / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()]
 
 
+def test_capture_coordination_reads_only_handshake_state(tmp_path, monkeypatch):
+    manager = ExperimentManager(tmp_path)
+    manager.running = True
+    manager.settings = {"acquisition_protocol": "force_target_wrench_v1"}
+    manager.trial_id = "T0007"
+
+    def expensive_read():
+        raise AssertionError("The frequent coordinator must not build a UI/writer snapshot")
+
+    monkeypatch.setattr(manager, "snapshot", expensive_read)
+    monkeypatch.setattr(manager, "_guided_snapshot", expensive_read)
+    manager.writer = type("Writer", (), {"status": staticmethod(expensive_read)})()
+    assert manager.coordination_snapshot() == {
+        "running": True, "acquisition_protocol": "force_target_wrench_v1", "trial_id": "T0007"}
+    manager.running, manager.trial_id = False, None
+    assert manager.coordination_snapshot() == {
+        "running": False, "acquisition_protocol": "force_target_wrench_v1", "trial_id": None}
+
+
 def test_new_grid_corners_and_versioned_operator_coordinate_definition(tmp_path, clock):
     grid = default_point_grid()
     corners = {point["id"]: (point["row"], point["col"], point["u"], point["v"], point["x_norm"], point["y_norm"])
@@ -564,28 +583,41 @@ def test_guided_delayed_invalid_result_revises_original_round_and_progress(tmp_p
     assert any(row["event"] == "guided_late_quality_update" for row in rows(manager, "events"))
 
 
-def test_guided_point_repetitions_progress_and_settings_bounds(tmp_path, clock):
-    for repetitions in (2, 1000, 3.5, True, "3"):
+@pytest.mark.parametrize("repetitions", [1, 2, 3])
+def test_guided_point_repetitions_progress_and_settings_bounds(tmp_path, clock, repetitions):
+    for invalid_repetitions in (0, -1, 1000, 1.0, 3.5, True, "1"):
         manager = ExperimentManager(tmp_path)
-        with pytest.raises(ValueError, match="3～999"):
-            manager.start(settings(guided_acquisition=True, repetitions_per_point=repetitions), context(clock.now))
-    manager = guided_manager(tmp_path, clock)
+        with pytest.raises(ValueError, match="1～999"):
+            manager.start(settings(guided_acquisition=True, repetitions_per_point=invalid_repetitions), context(clock.now))
+    manager = guided_manager(tmp_path, clock, repetitions=repetitions)
     manager.select_point("P01")
-    for version in range(2, 5):
+    for version in range(2, 2 + repetitions):
         ready(manager, clock, version=version)
         guided_preload(manager, clock, version=version)
         guided_loading(manager, clock, version=version)
         guided_unload(manager, clock, version=version)
     guided = manager.snapshot()["guided"]
-    assert guided["point_accepted"] == guided["point_attempts"] == 3
+    assert guided["point_accepted"] == guided["point_attempts"] == repetitions
     assert guided["point_progress_percent"] == 100 and guided["progress_percent"] == 4
     assert guided["step"] == "point_complete" and not guided["complete"]
     with pytest.raises(ValueError, match="尚未完成"):
-        manager.baseline_request(True, context(clock.now, 4))
+        manager.baseline_request(True, context(clock.now, 1 + repetitions))
     manager.select_point("P02")
     guided = manager.snapshot()["guided"]
     assert guided["point_accepted"] == guided["point_attempts"] == 0 and guided["current_round"] == 1
-    assert guided["accepted_by_point"]["P01"] == 3 and guided["total_accepted"] == 3
+    assert guided["accepted_by_point"]["P01"] == repetitions and guided["total_accepted"] == repetitions
+    manager.stop()
+
+
+def test_repetition_upper_bound_and_default_are_preserved(tmp_path, clock):
+    manager = guided_manager(tmp_path, clock, repetitions=999)
+    assert manager.snapshot()["settings"]["repetitions_per_point"] == 999
+    assert manager.snapshot()["guided"]["total_required"] == 24975
+    manager.stop()
+    manager = ExperimentManager(tmp_path)
+    manager.start(settings(guided_acquisition=True), context(clock.now))
+    assert manager.snapshot()["settings"]["repetitions_per_point"] == 3
+    assert manager.snapshot()["guided"]["total_required"] == 75
     manager.stop()
 
 

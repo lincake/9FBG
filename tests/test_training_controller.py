@@ -202,7 +202,7 @@ def test_acquisition_start_waits_for_training_without_archive_or_hardware_side_e
     service = AcquisitionService(Path(__file__).resolve().parents[1], tmp_path)
     starts = []
     snapshots = []
-    settings = {"finger_id": "训练互斥回归", "batch": "A"}
+    settings = {"finger_id": "训练互斥回归", "batch": "A", "data_id": "legacy-fixture"}
     context = {"running": False, "test_context": "no devices"}
 
     def snapshot():

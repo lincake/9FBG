@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 import queue
 import threading
@@ -11,13 +12,15 @@ import time
 
 from . import PRODUCT, VERSION
 from .storage import SessionWriter, clean
-from .tracking import PeakTracker
-from .experiment import ExperimentManager
+from .tracking import AUTO_REFERENCE_SOURCE, PeakTracker
+from .experiment import ExperimentManager, _settings, _context
 from .analysis import AnalysisController
 from .validation import ValidationController
 from .preferences import Preferences
 from .history import SessionHistory
 from .timing import AcquisitionTiming
+from .data_number import DataNumberAllocator, AUTOMATIC_SOURCE
+from .pulse import PulseBuffer, binding_fields, binding_key, initialization_reason
 
 
 class DisplayWriter:
@@ -65,10 +68,13 @@ class AcquisitionService:
         self.mode = None
         self.error = None
         self.tracker = PeakTracker()
+        self.pulse_buffer = PulseBuffer()
         self.latest = {}
         self.latest_force = None
         self.latest_sync = None
         self.synchronizer = None
+        from .sync import ForceSynchronizer
+        self.spectral_synchronizer = ForceSynchronizer(max_gap_ms=60, max_age_ms=45)
         self.writer = None
         self.sources = []
         self.workers = []
@@ -96,13 +102,66 @@ class AcquisitionService:
         self.experiment = ExperimentManager(userdata)
         self.analysis = AnalysisController(userdata)
         self.validation = ValidationController(userdata)
+        from .model_history import ModelHistory
+        self.model_history = ModelHistory(userdata)
         self.test_reference_freeze = False
         self.preferences = Preferences(userdata)
         self.history = SessionHistory(userdata)
+        self.data_numbers = DataNumberAllocator(userdata, self.preferences.values)
         self.guided_release_after_ns = None
         self.reference_history = []
         self.reference_history_version = 0
         self.acquisition_timing = {}
+        self._spectral_coord_stop = threading.Event()
+        self._spectral_coordinator = None
+        self._spectral_pause_reason = None
+        self._spectral_experiment_reference_id = None
+
+    def _wrench_protocol(self):
+        return self.experiment.settings.get("acquisition_protocol") in {"timed_wrench_v1", "force_target_wrench_v1"}
+
+    def _ensure_spectral_coordinator(self):
+        if self._spectral_coordinator is None:
+            self._spectral_coordinator = threading.Thread(target=self._coordinate_spectral,
+                name="9FBG-spectral-coordination", daemon=True)
+            self._spectral_coordinator.start()
+
+    def _coordinate_spectral(self):
+        """Wait for a batch-boundary pause without blocking commands or readers."""
+        while not self._spectral_coord_stop.wait(.02):
+            try:
+                self.analysis._refresh_spectral_training()
+                if self.experiment.settings.get("acquisition_protocol") == "force_target_wrench_v1":
+                    if (self.experiment.drift_results_checkpoint_ready()
+                            and self.experiment.recording_checkpoint_acknowledged()):
+                        self.analysis.spectral_runtime.invalidate("本轮已保存并建立下一轮参考，重新预热")
+                        self._spectral_experiment_reference_id = None
+                # The coordinator needs no chart, fitted curve or UI history.
+                # Building those while holding the experimental reader lock at
+                # 50 Hz can delay both independently acquired source streams.
+                experiment = self.experiment.coordination_snapshot()
+                wrench = experiment.get("acquisition_protocol") in {"timed_wrench_v1", "force_target_wrench_v1"}
+                trial_id = experiment.get("trial_id") if wrench and experiment.get("running") else None
+                reason = "acquisition:" + trial_id if trial_id else None
+                if self._spectral_pause_reason and self._spectral_pause_reason != reason:
+                    self.analysis.training_control("resume", self._spectral_pause_reason)
+                    self._spectral_pause_reason = None
+                if reason:
+                    if self._spectral_pause_reason != reason:
+                        self.analysis.training_control("pause", reason)
+                        self._spectral_pause_reason = reason
+                    training = self.analysis.training
+                    if not self.analysis.busy or training.get("status") == "paused":
+                        self.experiment.training_pause_acknowledged()
+            except Exception as exc:
+                self.experiment_error = "采集保护协调失败：" + str(exc)
+
+    def close(self):
+        self.disconnect()
+        self._spectral_coord_stop.set()
+        if self._spectral_coordinator is not None:
+            self._spectral_coordinator.join(3)
+        self.analysis.close()
 
     def _experiment_hook(self, method, *args):
         """Recording failures stop the experimental recorder, not live display."""
@@ -148,12 +207,54 @@ class AcquisitionService:
 
     def experiment_start(self, settings):
         with self.command_lock:
-            if self.analysis.busy:
+            self.analysis._refresh_spectral_training()
+            if self.analysis.busy and self.analysis.training.get("method") not in {"spectral_gru", "drift_gru"}:
                 raise ValueError("模型处理尚未结束，请等待完成后再建立采集会话")
             if self.recording:
                 raise ValueError("请先停止旧式连续记录，再使用独立点位采集会话")
+            if not self.experiment.running and self.experiment.writer is not None and self.experiment.writer.closed:
+                self._complete_data_number()
             self.experiment_error = None
-            self.experiment.start(settings, {**self.snapshot(), "tracker_config": deepcopy(self.tracker.config)})
+            context = {**self.snapshot(), "tracker_config": deepcopy(self.tracker.config)}
+            if settings.get("acquisition_protocol") in {"timed_wrench_v1", "force_target_wrench_v1"}:
+                from .spectral_data import _sample_rate
+                rate = _sample_rate({"acquisition_audit": {"devices": context.get("devices", [])}})
+                if rate != 25:
+                    raise ValueError("MLP＋GRU 六维采集请先明确设置光谱请求为 25 Hz 并重新连接；不能自动热改设备")
+            if "data_id" not in settings:
+                # Fail pure settings/device validation before creating a lease
+                # file; a failed start never consumes a number or connects IO.
+                checked = _settings(settings)
+                timed = checked.get("acquisition_protocol") in {"timed_wrench_v1", "force_target_wrench_v1"}
+                _context(context, stable=not timed, spectrum_only=timed)
+                settings = {**settings, "data_id": self.data_numbers.begin(), "data_id_source": AUTOMATIC_SOURCE}
+            elif "data_id_source" in settings:
+                settings = {key: value for key, value in settings.items() if key != "data_id_source"}
+            try:
+                self.experiment.start(settings, context)
+                if settings.get("data_id_source") == AUTOMATIC_SOURCE:
+                    self.data_numbers.bind(self.experiment.session_id)
+            except BaseException as start_error:
+                if settings.get("data_id_source") == AUTOMATIC_SOURCE:
+                    try:
+                        if self.experiment.running and self.experiment.settings.get("data_id_source") == AUTOMATIC_SOURCE:
+                            self.experiment.error = "自动数据编号会话建立失败，保留已写入数据但不计为完整保存"
+                            self.experiment.stop("自动数据编号会话建立失败")
+                    except BaseException as cleanup_error:
+                        raise start_error from cleanup_error
+                    finally:
+                        self.data_numbers.release()
+                raise
+            if self.experiment.settings.get("input_kind") == "delta_lambda_9":
+                # Keep the same Queue object: the processor owns its task_done.
+                # A bounded capture queue preserves fitted rows while readers
+                # remain non-blocking; overflow makes the round explicitly bad.
+                with self.frames.mutex:
+                    self.frames.maxsize = 256
+            if self._wrench_protocol():
+                self.analysis.spectral_runtime.invalidate("已建立新采集会话，等待本轮无载参考")
+                self._spectral_experiment_reference_id = None
+                self._ensure_spectral_coordinator()
         return self.snapshot()
 
     def experiment_baseline(self, confirmed):
@@ -166,12 +267,18 @@ class AcquisitionService:
             if self.guided_release_after_ns is not None:
                 raise ValueError("上轮光谱尾帧尚未处理完成，请稍候再标定；参考仍保持冻结")
             self.experiment.baseline_request(confirmed, self.snapshot())
+            self._spectral_experiment_reference_id = None
             self.reference(confirmed, experiment_command=True)
         return self.snapshot()
 
     def experiment_trial(self, action):
         with self.command_lock:
             self.experiment.trial(action, self.snapshot())
+            if self._wrench_protocol():
+                if action in {"start", "abort", "finish", "end"}:
+                    self.analysis.spectral_runtime.invalidate("试次边界已改变，等待 16 个连续源帧", reference=False)
+                self._ensure_spectral_coordinator()
+                return self.snapshot()
             if action == "start":
                 try:
                     self.press(True, experiment_command=True)
@@ -186,8 +293,47 @@ class AcquisitionService:
         with self.command_lock:
             if self.tracker.status().get("press_active"):
                 self.press(False, experiment_command=True)
-            self.experiment.stop(reason)
+            if self.experiment.running and self.experiment.settings.get("input_kind") == "delta_lambda_9":
+                target = self.experiment.begin_result_drain()
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    with self.experiment.lock:
+                        drained = self.experiment._drift_result_watermark_ns >= target
+                    if drained:
+                        break
+                    processor = getattr(self, "processor", None)
+                    if processor is None or not processor.is_alive():
+                        break
+                    time.sleep(.005)
+                with self.experiment.lock:
+                    if self.experiment._drift_result_watermark_ns < target:
+                        self.experiment.error = "九路峰心处理队列未排空；保留数据但不能宣布会话完整"
+            try:
+                self.experiment.stop(reason)
+            except BaseException:
+                # close() may have stopped the session before hashing or the
+                # manifest write failed. Release its tentative number without
+                # committing it, and preserve the original save exception.
+                if not self.experiment.running:
+                    self.data_numbers.release()
+                raise
+            if not self.recording:
+                with self.frames.mutex:
+                    self.frames.maxsize = 2
+            if self._wrench_protocol():
+                self.analysis.spectral_runtime.invalidate("采集会话已结束，请明确确认无接触并建立独立测试参考")
+                self._spectral_experiment_reference_id = None
+            self._complete_data_number()
         return self.snapshot()
+
+    def _complete_data_number(self):
+        writer = self.experiment.writer
+        try:
+            if writer is not None and writer.closed and not self.experiment.running:
+                self.data_numbers.complete_session(self.experiment.session_id, writer.path)
+        finally:
+            if not self.experiment.running:
+                self.data_numbers.release()
 
     def analysis_reference(self, confirmed):
         with self.command_lock:
@@ -195,8 +341,28 @@ class AcquisitionService:
                 raise ValueError("请明确确认接触棒已移开且当前无载")
             if self.experiment.snapshot().get("running"):
                 raise ValueError("实验会话内请使用试次无载基线操作")
+            self.analysis.require_reference_enabled()
             if not self.running or self.stop_event.is_set() or self.mode != "hardware":
                 raise ValueError("请先连接真实光谱设备，再建立独立测试参考")
+            if self.analysis.is_spectral():
+                if self.analysis.spectral_runtime.is_drift():
+                    # Fixed FBG identities need the existing explicitly
+                    # confirmed tracker initialization after a fresh connect.
+                    # Request it before the independent 2 s lambda0 request so
+                    # reference() cannot invalidate that new runtime request.
+                    with self.tracker_lock:
+                        self.tracker.end_press()
+                        self.test_reference_freeze = True
+                        try:
+                            self.reference(True)
+                            self.analysis.request_truth_zero(self.snapshot())
+                        except Exception:
+                            self.test_reference_freeze = False
+                            raise
+                    return self.snapshot()
+                self.analysis.request_truth_zero(self.snapshot())
+                self.test_reference_freeze = False
+                return self.snapshot()
             # Register the old version before a fast processor can commit the
             # newly requested reference; only that later version may authorize testing.
             with self.tracker_lock:
@@ -210,11 +376,36 @@ class AcquisitionService:
                     raise
         return self.snapshot()
 
-    def training_start(self, session_ids, method="linear"):
+    def analysis_stop(self):
         with self.command_lock:
             if self.experiment.snapshot().get("running"):
+                raise ValueError("采集会话正在运行，请先停止并保存采集会话，再结束推理")
+            if self.stopping:
+                raise ValueError("设备或采集正在停止保存，请等待完成后再结束推理")
+            if self.validation.snapshot().get("pending_sample"):
+                raise ValueError("请先保存本次判断或选择重新判断，再结束推理")
+            self.analysis.stop_inference()
+            with self.tracker_lock:
+                self.tracker.end_press()
+                self.test_reference_freeze = False
+            self._spectral_experiment_reference_id = None
+            return self.snapshot()
+
+    def training_start(self, session_ids, method="linear", options=None):
+        with self.command_lock:
+            experiment = self.experiment.snapshot()
+            if experiment.get("running") and method not in {"spectral_gru", "drift_gru"}:
                 raise ValueError("请先保存结束采集会话，再开始训练")
-            return self.analysis.start_job("train", session_ids, {"method": method})
+            if experiment.get("running") and (not self._wrench_protocol() or experiment.get("trial_id")):
+                raise ValueError("MLP＋GRU 训练请在六维采集的试次间隙启动；活动轮次保持采集保护")
+            result = self.analysis.start_job("train", session_ids, {**(options or {}), "method": method})
+            if method in {"spectral_gru", "drift_gru"}:
+                self._ensure_spectral_coordinator()
+            return result
+
+    def training_control(self, action):
+        with self.command_lock:
+            return {"training": self.analysis.training_control(action, "user")}
 
     def history_snapshot(self):
         with self.command_lock:
@@ -227,6 +418,7 @@ class AcquisitionService:
 
     def history_change(self, session_ids, *, restore=False):
         with self.command_lock:
+            self.analysis._refresh_spectral_training()
             if self.analysis.busy:
                 raise ValueError("模型训练或处理正在进行，请完成后再删除或恢复历史数据")
             experiment = self.experiment.snapshot()
@@ -235,20 +427,74 @@ class AcquisitionService:
             action = self.history.restore if restore else self.history.delete
             return action(session_ids)
 
-    def analysis_load(self, model_id):
+    def analysis_load(self, model_id, unloaded_confirmed=False):
         with self.command_lock:
-            if self.experiment.snapshot().get("running"):
-                raise ValueError("请先保存结束采集会话，再载入实机验证模型")
+            experiment = self.experiment.snapshot()
+            spectral_candidate = isinstance(model_id, str) and (model_id.startswith("S") or (self.userdata / "spectral_models" / model_id).is_dir())
+            if experiment.get("running") and (not spectral_candidate or not self._wrench_protocol() or experiment.get("trial_id")):
+                raise ValueError("请先保存结束采集会话，再载入模型进行模型推理")
+            if spectral_candidate:
+                zero = (experiment.get("baseline") or {}) if experiment.get("running") else self.analysis.truth_zero
+                offsets = zero.get("force_zero", zero.get("offsets"))
+                epoch = zero.get("force_epoch", zero.get("epoch"))
+                force = self.latest_force
+                fresh = bool(force and force.get("stream_epoch") == epoch and
+                    0 <= (time.perf_counter_ns()-force.get("host_rx_monotonic_ns", 0))/1e6 <= 250 and
+                    not force.get("stale") and not self.force_stop_event.is_set())
+                if zero.get("ready") and offsets and fresh:
+                    norm = math.sqrt(sum((a-b)**2 for a,b in zip(force["force_values"][:3], offsets[:3])))
+                    if norm > .1:
+                        raise ValueError("当前合力尚未接近有效无载零点，请完全卸载后切换模型")
+                elif unloaded_confirmed is not True:
+                    raise ValueError("切换全谱模型前，请明确确认当前无接触；新模型应用后重新建立 S0")
             result = self.analysis.load(model_id)
+            self._spectral_experiment_reference_id = None
             with self.tracker_lock:
                 self.tracker.end_press()
                 self.test_reference_freeze = False
             analysis = self.analysis.snapshot()
             self.validation.configure(analysis["model_sha256"], model_id)
-            return result
+            return {**result, **self.snapshot()}
 
-    def validation_freeze(self, actual_point_id=None):
+    def _model_management_block(self):
+        self.analysis._refresh_spectral_training()
+        if self.analysis.busy:
+            return "模型训练或处理正在进行，请完成后再删除或恢复模型"
+        if self.experiment.snapshot().get("running") or self.recording or self.stopping:
+            return "采集或保存正在进行，请先停止并保存会话，再管理模型"
+        if self.validation.has_pending():
+            return "请先保存本次判断或选择重新判断，再删除或恢复模型"
+        return None
+
+    def models_snapshot(self):
+        # Read-only catalogs use their own asset cache/transfer lock. Waiting
+        # behind a device command can otherwise turn a healthy listing into a
+        # timeout. All model mutations still recheck the live command guards.
+        blocked = self._model_management_block()
+        with self.analysis.lock:
+            active = self.analysis.model_id if self.analysis.inference_active else None
+        return self.model_history.cached_snapshot(self.analysis.models,
+            in_use_model_id=active, blocked_reason=blocked)
+
+    def models_change(self, model_ids, *, restore=False):
         with self.command_lock:
+            blocked = self._model_management_block()
+            if blocked:
+                raise ValueError(blocked)
+            with self.analysis.lock:
+                active = self.analysis.model_id if self.analysis.inference_active else None
+            result = (self.model_history.restore(model_ids) if restore else
+                      self.model_history.delete(model_ids, in_use_model_id=active))
+            if not restore and self.analysis.forget_models(result["deleted_ids"]):
+                self.validation.detach_model()
+                self._spectral_experiment_reference_id = None
+            key = "restored_ids" if restore else "deleted_ids"
+            return {**self.snapshot(), **self.models_snapshot(), key: result[key]}
+
+    def validation_freeze(self, actual_point_id=None, wrench_tolerances=None):
+        with self.command_lock:
+            if self.analysis.is_spectral():
+                return self._spectral_validation_freeze(actual_point_id, wrench_tolerances)
             if actual_point_id is not None and (not isinstance(actual_point_id, str)
                     or actual_point_id not in {f"P{i:02d}" for i in range(1, 26)}):
                 raise ValueError("验证目标点位必须为 P01～P25，或留空")
@@ -260,7 +506,7 @@ class AcquisitionService:
                 zero = analysis["truth_zero"]
                 if (not state["running"] or state["mode"] != "hardware" or state["experiment"].get("running")
                         or not analysis.get("model_id") or not analysis.get("model_sha256")):
-                    raise ValueError("请载入模型，连接真实设备，并在采集会话结束后进行实机验证")
+                    raise ValueError("请载入模型，连接真实设备，并在采集会话结束后进行模型推理")
                 if prediction.get("comparison_ready") is not True:
                     raise ValueError("当前没有新鲜且同步的实际按压对照；请完成无载参考后按压，保持稳定再冻结")
                 if sync.get("spectrum_stream_epoch") != tracker.get("stream_epoch"):
@@ -306,12 +552,91 @@ class AcquisitionService:
             result.update(reference_frozen=True, press_active=True)
             self.test_reference_freeze = False
 
+    def _spectral_comparison(self, analysis, force, experiment):
+        prediction = analysis["prediction"]
+        prediction.update(comparison_ready=False, wrench_truth=None, wrench_error=None)
+        if not prediction.get("valid"):
+            return
+        baseline = experiment.get("baseline") or {}
+        if experiment.get("running"):
+            reference_id = None if analysis.get("input_kind") == "delta_lambda_9" else (baseline.get("spectral_reference") or {}).get("reference_id")
+            if reference_id and prediction.get("reference_id") != reference_id:
+                prediction.update(valid=False, status="预热", point_id=None, wrench_pred=None,
+                                  reason="本轮参考已更新，等待新参考的连续全谱窗口")
+                return
+            from .analysis import _physical_definition
+            expected = analysis.get("model_definition")
+            actual = _physical_definition(experiment.get("settings", {}))
+            if expected and any(expected.get(key) != actual.get(key) for key in ("finger_id", "point_grid", "coordinate_definition")):
+                prediction.update(valid=False, status="无效", point_id=None, reason="当前触觉件或点阵与全谱模型不一致")
+                return
+            zero = {"ready": baseline.get("ready"), "offsets": baseline.get("force_zero"),
+                    "epoch": baseline.get("force_epoch"), "zero_id": baseline.get("baseline_id")}
+        else:
+            zero = analysis["truth_zero"]
+        offsets = zero.get("offsets")
+        if not zero.get("ready") or not offsets or not force or force.get("stale"):
+            return
+        # Snapshot construction does not own the acquisition lock. Only the
+        # synchronizer and its exact matched source records need this lock;
+        # prediction/report formatting must not hold up the PX6D reader.
+        with self.lock:
+            sync = self.spectral_synchronizer.align({"frame_id": prediction["frame_id"], "stream_epoch": prediction["stream_epoch"],
+                "host_rx_monotonic_ns": prediction["host_rx_monotonic_ns"], "time_quality": "host_rx_approx"})
+            source_ids = sync.get("force_frame_ids", [])
+            sources = [deepcopy(f) for f in self.spectral_synchronizer.frames if f.get("frame_id") in source_ids and f.get("stream_epoch") == zero.get("epoch")]
+        if not sync.get("valid") or sync.get("matched") is not True or sync.get("method") not in {"exact_receive_time", "linear_receive_time"} or sync.get("force_stream_epoch") != zero.get("epoch"):
+            return
+        stamp = prediction["host_rx_monotonic_ns"]
+        times = sorted(f["host_rx_monotonic_ns"] for f in sources)
+        if sync.get("method") == "linear_receive_time" and (len(times) != 2 or
+                not times[0] < stamp < times[1] or times[1] - times[0] > 60_000_000 or
+                max(stamp - times[0], times[1] - stamp) > 45_000_000):
+            return
+        truth = [value - offset for value, offset in zip(sync["force_values"], offsets)]
+        context = {**prediction["prediction_context"], "force_epoch": zero.get("epoch"), "zero_id": zero.get("zero_id")}
+        prediction.update(wrench_truth=truth, wrench_error=[a-b for a, b in zip(prediction["wrench_pred"], truth)],
+            truth_force_norm_N=math.sqrt(sum(x*x for x in truth[:3])), sync=deepcopy(sync),
+            force_zero=deepcopy(offsets), zero_id=zero.get("zero_id"), force_source_frames=sources,
+            prediction_context=context, truth_context=deepcopy(context),
+            comparison_ready=bool(not experiment.get("running") and analysis["test_reference"].get("ready") and
+                                  all(0 <= (time.perf_counter_ns() - t) / 1e6 <= 250 for t in times)))
+
+    def _spectral_validation_freeze(self, actual_point_id, tolerances):
+        with self.tracker_lock, self.lock:
+            state = self.snapshot()
+            analysis = state["analysis"]
+            prediction = analysis["prediction"]
+            if state["experiment"].get("running") or state["mode"] != "hardware" or not state["running"]:
+                raise ValueError("请结束并保存采集会话，在独立模型推理流程中冻结")
+            if not prediction.get("valid") or not prediction.get("comparison_ready"):
+                raise ValueError("当前缺少新鲜全谱窗口与独立六轴对照，请建立无载参考后实际按压")
+            if prediction.get("truth_force_norm_N", 0) <= .05:
+                raise ValueError("无载不能作为一次实际按压验证")
+            raw = self.analysis.spectral_runtime.evidence_for(prediction["frame_id"], prediction["stream_epoch"], prediction["reference_id"])
+            evidence = {"schema": "spectral_validation_evidence_v1", "valid": True, "source_kind": "hardware",
+                "stale": False, "age_ms": prediction["age_ms"], "force_age_ms": (state.get("force") or {}).get("age_ms"),
+                "target_point_id": actual_point_id, "model_id": analysis["model_id"],
+                "model_checksum": analysis["model_sha256"], "frame_id": prediction["frame_id"],
+                "host_rx_monotonic_ns": prediction["host_rx_monotonic_ns"], "optical_epoch": prediction["stream_epoch"],
+                "force_epoch": prediction["sync"]["force_stream_epoch"], "reference_id": prediction["reference_id"],
+                "reference_version": None, "zero_id": prediction["zero_id"], "prediction": deepcopy(prediction),
+                "prediction_context": prediction["prediction_context"], "truth_context": prediction["truth_context"],
+                "sync": prediction["sync"], "force_source_frames": prediction["force_source_frames"],
+                "force_zero": prediction["force_zero"], "zero_reference": deepcopy(analysis["truth_zero"]),
+                "wrench_tolerances": tolerances or [None]*6,
+                "axes": ["Fx", "Fy", "Fz", "Mx", "My", "Mz"], "units": ["N", "N", "N", "N·m", "N·m", "N·m"],
+                "test_reference_ready": True, "truth_zero_ready": True, "experiment_running": False,
+                "reference_frozen": True, **raw}
+        sample = self.validation.capture(evidence)
+        return {"sample": sample, "validation": self.validation.snapshot(analysis["model_id"], analysis["model_sha256"])}
+
     def _event(self, event, **data):
         if self.writer and not self.writer.closed:
             self.writer.submit("events", {"event": event, "host_monotonic_ns": time.perf_counter_ns(), **data})
 
     def connect(self, mode="hardware", replay_frames=None, config=None, *, record=True,
-                connect_force=True, integration_us=None, sample_rate_hz=None):
+                connect_force=True, integration_us=None, sample_rate_hz=None, auto_reference=False):
         with self.command_lock:
             if self.running or self.stopping:
                 raise ValueError("当前采集尚未停止")
@@ -321,8 +646,14 @@ class AcquisitionService:
                 raise ValueError("请先载入原始光谱 JSONL，回放不能生成测量数据")
             if type(record) is not bool or type(connect_force) is not bool:
                 raise ValueError("记录与六轴连接选项必须为布尔值")
+            if type(auto_reference) is not bool:
+                raise ValueError("连接后自动九峰参考选项必须为布尔值")
+            if auto_reference and mode != "hardware":
+                raise ValueError("连接自动九峰参考仅用于本次真实光谱连接，回放请使用明确确认的参考操作")
             optical_settings = optical_request_settings(integration_us, sample_rate_hz)
             self.tracker = PeakTracker(config)
+            self.analysis.spectral_runtime.invalidate("光谱连接或配置已改变，请重建全谱参考")
+            self._spectral_experiment_reference_id = None
             self.mode, self.error, self.latest = mode, None, {}
             self.latest_force = self.latest_sync = None
             self.frames = queue.Queue(maxsize=256 if record else 2)
@@ -349,6 +680,7 @@ class AcquisitionService:
             self.sources = []
             self.workers = []
             self.synchronizer = None
+            self.spectral_synchronizer.clear()
             self.recording = record
             self.force_source = self.force_worker = None
             self.force_stop_event = threading.Event()
@@ -375,6 +707,16 @@ class AcquisitionService:
                     self.synchronizer = ForceSynchronizer()
                     spectrum = BaySpecSource({**device_config.get("bayspec", {}), **optical_settings})
                     self.sources.append(spectrum)
+                    if auto_reference:
+                        # Arm before the optical reader can publish its first
+                        # frame. Adapter backlog older than this connection's
+                        # request must not supply any of its stable frames.
+                        with self.tracker_lock, self.lock:
+                            self.tracker.request_connection_reference()
+                            self.reference_min_rx_ns = time.perf_counter_ns()
+                            self._event("optical_connect_auto_reference_requested",
+                                        reference_source=AUTO_REFERENCE_SOURCE, unloaded_confirmed=False,
+                                        minimum_source_rx_ns=self.reference_min_rx_ns)
                     optical = threading.Thread(target=self._reader, args=(spectrum, "spectrum"), name="9FBG-optical", daemon=True)
                     self.workers.append(optical)
                     optical.start()
@@ -468,6 +810,7 @@ class AcquisitionService:
                     with self.lock:
                         self.latest_force = deepcopy(frame)
                         self.synchronizer.add(frame)
+                        self.spectral_synchronizer.add(frame)
         except Exception as exc:
             with self.lock:
                 self.error = ("光谱采集失败：" if kind == "spectrum" else "PX6D 参考不可用：") + str(exc)
@@ -529,7 +872,20 @@ class AcquisitionService:
                 frame["replay_operation_phase"] = self.capture_phase
         self.writer.submit("raw_spectra", frame)
         self._experiment_hook("on_spectrum", frame)
+        if (self.analysis.is_spectral() and not self.analysis.spectral_runtime.is_drift()
+                and self._wrench_protocol() and self.experiment.running):
+            with self.experiment.lock:
+                baseline = self.experiment.baseline
+                reference = baseline.get("spectral_reference") if self.experiment.running and baseline.get("ready") else None
+                reference_id = reference.get("reference_id") if reference else None
+                if reference_id and reference_id != self._spectral_experiment_reference_id:
+                    self.analysis.spectral_runtime.set_reference(reference)
+                    self._spectral_experiment_reference_id = reference_id
+        self.analysis.on_spectrum(frame)
         now = time.perf_counter_ns()
+        drift_overflow = False
+        drift_draining = (getattr(self.experiment, "settings", {}).get("input_kind") == "delta_lambda_9"
+                          and self.experiment._drift_beyond_stop(frame))
         with self.lock:
             self.metrics["received"] += 1
             self.rx_times.append(now)
@@ -552,10 +908,16 @@ class AcquisitionService:
             if frame.get("intensity") == self.previous_payload:
                 self.metrics["identical_payloads"] += 1
             self.previous_payload = deepcopy(frame.get("intensity"))
+            if drift_draining:
+                # During controlled save only previously accepted source fits
+                # enter the queue. Display-only new arrivals cannot keep the
+                # capture backlog growing or manufacture an overflow fault.
+                self.metrics["display_skipped"] += 1
+                return
             try:
                 self.frames.put_nowait((deepcopy(frame), now))
             except queue.Full:
-                if not self.recording:
+                if not self.recording and not (self.experiment.running and self.experiment.settings.get("input_kind") == "delta_lambda_9"):
                     # Display follows the newest received spectrum. Each evicted
                     # queued item completes its queue task without becoming a
                     # hardware loss or a recorded-data processing overflow.
@@ -571,7 +933,11 @@ class AcquisitionService:
                     self.metrics["dropped"] += 1
                     self.error = "提峰队列已满；原始光谱已保存，该帧未参与拟合"
                     self._event("processing_overflow", frame_id=frame.get("frame_id"))
+                    if self.experiment.running and self.experiment.settings.get("input_kind") == "delta_lambda_9":
+                        drift_overflow = True
             self.metrics["max_queue_depth"] = max(self.metrics["max_queue_depth"], self.frames.qsize())
+        if drift_overflow:
+            self._experiment_hook("drift_processing_overflow", frame)
 
     def _process(self):
         if self.mode == "hardware":
@@ -615,7 +981,9 @@ class AcquisitionService:
                         eligibility_ns = frame.get("host_rx_monotonic_ns", 0) if self.mode=="hardware" else received_ns
                         if self.tracker.status().get("reference_pending") and eligibility_ns < self.reference_min_rx_ns:
                             origin={key:deepcopy(frame.get(key)) for key in ("frame_id","host_rx_monotonic_ns","time_quality","timestamp_source","stream_epoch","device_sequence","device_timestamp_raw","read_start_ns","read_end_ns")}
-                            reason="该光谱早于本次无载确认；仅保存原始帧"
+                            automatic = self.tracker.status().get("pending_reference_source") == AUTO_REFERENCE_SOURCE
+                            reason=("该光谱早于本次连接自动参考申请；仅保存原始帧" if automatic
+                                    else "该光谱早于本次无载确认；仅保存原始帧")
                             result = {**self.tracker.status(), **origin,
                                       "peaks":[{"id":f"FBG{i}","valid":False,"stale":False,"failure_reason":reason,
                                                 "center_nm":None,"drift_nm":None,"amplitude":None,"fwhm_nm":None,
@@ -624,10 +992,13 @@ class AcquisitionService:
                         else:
                             result = self.tracker.process(frame)
                         self._freeze_independent_reference(result, frame)
+                        self.pulse_buffer.append(frame, result)
                         reference_state = self.tracker.export_state() if result.get("reference_version") != previous_version else None
                         if reference_state:
                             self.reference_history = deepcopy(reference_state.get("reference_history", []))
                             self.reference_history_version = result.get("reference_version")
+                    from .drift_features import make_drift_frame
+                    result["drift_features"] = make_drift_frame(result, frame)
                     with self.lock:
                         sync = self.synchronizer.align(frame) if self.synchronizer else {"valid": False, "reason": "未接入力参考；光谱提峰独立运行"}
                         self.latest, self.latest_sync = {"frame": frame, "tracker": result}, sync
@@ -642,9 +1013,13 @@ class AcquisitionService:
                             self._event("reference_commit", frame_id=frame.get("frame_id"), state=reference_state)
                     self.writer.submit("results", {"result": result, "sync": sync, "processing_ms": duration})
                     self._experiment_hook("on_result", {**result, "source_kind": frame.get("source_kind")}, sync)
+                    annotation = self.experiment.source_annotation(frame.get("host_rx_monotonic_ns")) if self.experiment.running else None
+                    self.analysis.on_result(result["drift_features"], annotation)
                 except Exception as exc:
                     with self.lock:
                         self.error = "处理失败：" + str(exc)
+                    if self.experiment.running and self.experiment.settings.get("input_kind") == "delta_lambda_9":
+                        self._experiment_hook("drift_processing_failure", frame, "九路峰心处理失败；本轮派生数据不完整："+str(exc))
                     try:
                         self._event("processing_error", frame_id=frame.get("frame_id"), reason=str(exc))
                     except Exception:
@@ -661,6 +1036,7 @@ class AcquisitionService:
             if not self.running or self.stop_event.is_set():
                 raise ValueError("请先启动光谱采集或回放")
             self.tracker.request_reference(unloaded_confirmed=confirmed)
+            self.analysis.spectral_runtime.invalidate("光学参考已改变，请建立独立全谱参考")
             self.reference_min_rx_ns = time.perf_counter_ns()
             self.capture_phase = "unloaded"
             self.pending_confirmation = True
@@ -689,6 +1065,7 @@ class AcquisitionService:
             return self._disconnect()
 
     def _disconnect(self):
+        self.analysis.spectral_runtime.invalidate("光谱已断开，请重连后重建全谱参考")
         if not self.running:
             return self.snapshot()
         self.stopping = True
@@ -712,11 +1089,84 @@ class AcquisitionService:
             self.writer.close({"metrics": self.metrics, "algorithm": self.tracker.export_state(), "error": self.error,
                                "devices": [source.diagnostics() for source in self.sources]})
             self.running = self.stopping = False
+        self._complete_data_number()
         return self.snapshot()
 
+    def pulse_reference(self, confirmed):
+        """Explicit first initialization through the existing unloaded workflow."""
+        with self.command_lock:
+            if confirmed is not True:
+                raise ValueError("请先移开手指，并明确确认当前无载后再初始化九峰参考")
+            with self.tracker_lock, self.lock:
+                state = {"running": self.running, "stopping": self.stopping,
+                         "stopped": self.stop_event.is_set(), "mode": self.mode,
+                         "recording": self.recording, "press_active": self.tracker._press,
+                         "pending": self.tracker._pending_reference, "initialized": bool(self.tracker._anchors)}
+            with self.experiment.lock:
+                state["experiment_running"] = self.experiment.running
+            with self.analysis.lock:
+                state.update(inference_active=self.analysis.inference_active, busy=self.analysis.busy)
+            reason = initialization_reason(**state)
+            if reason:
+                raise ValueError(reason)
+            # Reuse the existing reference request, source-time cutoff, stable
+            # checks and versioning. This never connects either instrument.
+            self.reference(True)
+            return self.pulse_samples()
+
+    def pulse_samples(self, after=0, limit=4096):
+        """A small read-only feed, independent of UI/analysis/history snapshots."""
+        page = self.pulse_buffer.read(after, limit)
+        latest = page.pop("latest")
+        # Read just the reference binding, not status metrics, spectra, model
+        # reports or recorder history. Use the existing tracker/service lock order.
+        with self.tracker_lock, self.lock:
+            tracker = self.tracker
+            current = {"reference_version": tracker._reference_version,
+                       "reference_nm": list(tracker._reference),
+                       "config_version": tracker.config_version,
+                       "algorithm_version": tracker.algorithm_version}
+            pending, initialized, press_active = tracker._pending_reference, bool(tracker._anchors), tracker._press
+            frame = self.latest.get("frame", {})
+            current_binding = binding_key(binding_fields(frame, current))
+            running, stopping, mode = self.running, self.stopping, self.mode
+            recording, stopped = self.recording, self.stop_event.is_set()
+        with self.experiment.lock:
+            experiment_running = self.experiment.running
+        with self.analysis.lock:
+            inference_active, busy = self.analysis.inference_active, self.analysis.busy
+        can_initialize = not initialization_reason(
+            running=running, stopping=stopping, stopped=stopped, mode=mode,
+            recording=recording, experiment_running=experiment_running, inference_active=inference_active,
+            busy=busy, press_active=press_active, pending=pending, initialized=initialized)
+        stamp = latest.get("t_ns") if latest else None
+        age = max(0, (time.perf_counter_ns() - stamp) / 1e6) if type(stamp) is int and stamp > 0 else None
+        if (recording and running) or experiment_running or inference_active:
+            reason = "记录、实验采集或模型推理正在运行；请先结束该流程再测量脉搏"
+        elif stopping or not running or stopped:
+            reason = "光谱采集已停止或正在关闭"
+        elif mode != "hardware":
+            reason = "脉搏测量只接受当前真实设备光谱"
+        elif pending or not initialized:
+            reason = "等待明确无载确认与参考初始化完成"
+        elif latest is None or age is None or age > 1000:
+            reason = "光谱超过 1 秒未更新或缺少源帧接收时间"
+        elif latest["binding"] != current_binding:
+            reason = "采集段或参考已变化；等待当前绑定的新源帧"
+        elif not latest["valid"]:
+            reason = latest["reason"] or "当前源帧九路光栅尚未全部有效"
+        else:
+            reason = ""
+        return {"schema": "nine_fbg_pulse_samples_v1", "version": VERSION,
+                **page, "running": running, "stopping": stopping, "mode": mode,
+                "blocked": bool(reason), "reason": reason, "age_ms": age,
+                "latest_binding": current_binding, "can_initialize": can_initialize}
+
     def snapshot(self):
-        # Keep the current reference and published result capture in the same
-        # tracker -> service lock order used by reference/press commands.
+        # Capture the tracker/reference and published source frame together.
+        # No UI report, experiment history, model work or adapter diagnostics may
+        # run under this reader-shared lock. A slow GET /state must not delay the
+        # next actual PX6D or optical source read.
         with self.tracker_lock, self.lock:
             current = self.tracker.status()
             if self.reference_history_version != current.get("reference_version"):
@@ -725,57 +1175,129 @@ class AcquisitionService:
             reference_history = deepcopy(self.reference_history)
             tracker = deepcopy(self.latest.get("tracker", current))
             reference_changed = tracker.get("reference_version", 0) != current.get("reference_version", 0)
-            for field in ("reference_pending", "press_active", "reference_frozen", "reference_version", "reference_nm"):
+            for field in ("reference_pending", "pending_reference_source", "reference_source", "reference_unloaded_confirmed",
+                          "press_active", "reference_frozen", "reference_version", "reference_nm"):
                 tracker[field] = deepcopy(current.get(field))
             frame = deepcopy(self.latest.get("frame", {}))
-            if frame:
-                stamp = frame.get("host_rx_monotonic_ns") if self.mode == "hardware" else self.latest.get("received_ns")
-                age = max(0, (time.perf_counter_ns() - stamp) / 1e6) if type(stamp) is int and stamp > 0 else None
-                # Reception staleness is distinct from acquisition quality, including replay.
-                tracker["display_age_ms"] = age
-                if reference_changed or age is None or age > 1000 or not self.running or self.stop_event.is_set():
-                    tracker["display_stale"] = True
-                    for peak in tracker.get("peaks", []):
-                        peak.update(valid=False, stale=True, age_ms=max(age or 0, peak.get("age_ms") or 0))
-                        peak["failure_reason"] = ("该光谱拟合使用旧参考；等待本次参考的处理结果" if reference_changed else
-                                                  peak.get("failure_reason") or ("原始光谱缺少采集接收时间" if age is None else "采集已停止或光谱超过 1 秒未更新"))
-            metrics = {**self.metrics, "queue_depth": self.frames.qsize()}
-            device_diagnostics = [source.diagnostics() for source in self.sources]
-            metrics["input_queue_depth"] = sum(d.get("queue_backlog",0) for d in device_diagnostics)
-            metrics["writer_queue_depth"] = self.writer.queue.qsize() if self.writer else 0
-            if len(self.rx_times)>1:
-                intervals = sorted((right-left)/1e6 for left,right in zip(self.rx_times, list(self.rx_times)[1:]))
-                metrics["receive_intervals_ms"] = {name:intervals[int((len(intervals)-1)*q)] for name,q in [("p50",.5),("p95",.95),("p99",.99)]}
-            tracker["reference_history"] = reference_history
+            received_ns = self.latest.get("received_ns")
             force = deepcopy(self.latest_force)
-            if force:
-                force["age_ms"] = max(0,(time.perf_counter_ns()-force["host_rx_monotonic_ns"])/1e6)
-                force["stale"] = force.get("stale") is True or force["age_ms"]>250 or not self.running or self.stop_event.is_set() or self.force_stop_event.is_set()
-            experiment = self.experiment.snapshot()
-            baseline = experiment.get("baseline") or {}
-            experiment["live_force"] = {"valid": False, "force_N": None, "reason": "等待本次无载基线及新鲜 PX6D 数据"}
-            if baseline.get("ready") and baseline.get("force_zero") and force and not force.get("stale") and force.get("stream_epoch") == baseline.get("force_epoch"):
-                normal = experiment.get("settings", {}).get("force_sign", -1) * (force["force_values"][2] - baseline["force_zero"][2])
-                experiment["live_force"] = {"valid": True, "force_N": normal, "raw_Fz_N": force["force_values"][2],
-                                            "zero_Fz_N": baseline["force_zero"][2], "age_ms": force["age_ms"],
-                                            "over_provisional_range": normal > experiment.get("settings", {}).get("max_force_N", 3),
-                                            "reason": "最新六轴接收值减本次零点；不是光谱同步标签或模型预测"}
-            if getattr(self, "experiment_error", None):
-                experiment["error"] = self.experiment_error
-            analysis = self.analysis.snapshot(tracker, force, deepcopy(self.latest_sync), experiment, source_kind=frame.get("source_kind"))
-            validation = self.validation.snapshot(analysis.get("model_id"), analysis.get("model_sha256"))
-            response = {"product": PRODUCT, "version": VERSION, "running": self.running,
-                          "stopping": self.stopping, "mode": self.mode, "error": self.error,
-                          "tracker": tracker, "frame": frame, "metrics": metrics,
-                          "force": force, "sync": deepcopy(self.latest_sync),
-                          "recording": self.recording and self.running,
-                          "force_error": self.force_error,
-                          "force_connected": bool(self.running and not self.stop_event.is_set() and not self.force_stop_event.is_set() and self.force_source and self.force_source.diagnostics().get("connected")),
-                          "force_connecting": bool(self.force_worker and self.force_worker.is_alive() and self.force_source and not self.force_source.diagnostics().get("connected") and not self.force_stop_event.is_set()),
-                          "force_diagnostic_history": list(self.force_history),
-                          "acquisition_timing": {key: value.diagnostics() for key, value in self.acquisition_timing.items()},
-                          "devices": device_diagnostics,
-                          "experiment": experiment, "analysis": analysis, "validation": validation,
-                          "session": self.writer.status() if self.writer and self.recording else None}
-        # JSON-safe copying must not extend the service lock held by readers.
-        return clean(response)
+            sync = deepcopy(self.latest_sync)
+            metrics = {**self.metrics, "queue_depth": self.frames.qsize()}
+            rx_times = list(self.rx_times)
+            sources = tuple(self.sources)
+            force_source, force_worker = self.force_source, self.force_worker
+            force_history = deepcopy(list(self.force_history))
+            acquisition_timing = tuple(self.acquisition_timing.items())
+            writer = self.writer
+            running, stopping, mode = self.running, self.stopping, self.mode
+            stopped, force_stopped = self.stop_event.is_set(), self.force_stop_event.is_set()
+            recording, error, force_error = self.recording, self.error, self.force_error
+            experiment_error = getattr(self, "experiment_error", None)
+        if frame:
+            stamp = frame.get("host_rx_monotonic_ns") if mode == "hardware" else received_ns
+            age = max(0, (time.perf_counter_ns() - stamp) / 1e6) if type(stamp) is int and stamp > 0 else None
+            # Reception staleness is distinct from acquisition quality, including replay.
+            tracker["display_age_ms"] = age
+            if reference_changed or age is None or age > 1000 or not running or stopped:
+                tracker["display_stale"] = True
+                for peak in tracker.get("peaks", []):
+                    peak.update(valid=False, stale=True, age_ms=max(age or 0, peak.get("age_ms") or 0))
+                    peak["failure_reason"] = ("该光谱拟合使用旧参考；等待本次参考的处理结果" if reference_changed else
+                                              peak.get("failure_reason") or ("原始光谱缺少采集接收时间" if age is None else "采集已停止或光谱超过 1 秒未更新"))
+        device_diagnostics = [source.diagnostics() for source in sources]
+        force_diagnostics = next((diagnostic for source, diagnostic in zip(sources, device_diagnostics)
+                                  if source is force_source), {})
+        metrics["input_queue_depth"] = sum(d.get("queue_backlog", 0) for d in device_diagnostics)
+        metrics["writer_queue_depth"] = writer.queue.qsize() if writer else 0
+        if len(rx_times) > 1:
+            intervals = sorted((right-left)/1e6 for left, right in zip(rx_times, rx_times[1:]))
+            metrics["receive_intervals_ms"] = {name: intervals[int((len(intervals)-1)*q)] for name, q in [("p50", .5), ("p95", .95), ("p99", .99)]}
+        tracker["reference_history"] = reference_history
+        if force:
+            force["age_ms"] = max(0, (time.perf_counter_ns()-force["host_rx_monotonic_ns"])/1e6)
+            force["stale"] = force.get("stale") is True or force["age_ms"] > 250 or not running or stopped or force_stopped
+        experiment = self.experiment.snapshot()
+        baseline = experiment.get("baseline") or {}
+        experiment["live_force"] = {"valid": False, "force_N": None, "reason": "等待本次无载基线及新鲜 PX6D 数据"}
+        if baseline.get("ready") and baseline.get("force_zero") and force and not force.get("stale") and force.get("stream_epoch") == baseline.get("force_epoch"):
+            normal = experiment.get("settings", {}).get("force_sign", -1) * (force["force_values"][2] - baseline["force_zero"][2])
+            experiment["live_force"] = {"valid": True, "force_N": normal, "raw_Fz_N": force["force_values"][2],
+                                        "zero_Fz_N": baseline["force_zero"][2], "age_ms": force["age_ms"],
+                                        "over_provisional_range": normal > experiment.get("settings", {}).get("max_force_N", 3),
+                                        "reason": "最新六轴接收值减本次零点；不是光谱同步标签或模型预测"}
+            if experiment.get("settings", {}).get("acquisition_protocol") in {"timed_wrench_v1", "force_target_wrench_v1"}:
+                wrench = [a-b for a, b in zip(force["force_values"], baseline["force_zero"])]
+                norm = math.sqrt(sum(x*x for x in wrench[:3]))
+                experiment["live_force"] = {"schema": "live_wrench_v1", "valid": True,
+                    "wrench": wrench, "force_norm_N": norm, "age_ms": force["age_ms"],
+                    "axes": ["Fx", "Fy", "Fz", "Mx", "My", "Mz"], "units": ["N", "N", "N", "N·m", "N·m", "N·m"],
+                    "over_provisional_range": norm > experiment["settings"]["max_force_norm_N"],
+                    "reason": "实际 PX6D 六轴减固定软件零偏；合力仅含 Fx/Fy/Fz，不含力矩"}
+        if experiment_error:
+            experiment["error"] = experiment_error
+        analysis = self.analysis.snapshot(tracker, force, sync, experiment, source_kind=frame.get("source_kind"))
+        if analysis.get("model_kind") == "spectral_gru":
+            self._spectral_comparison(analysis, force, experiment)
+        validation = self.validation.snapshot(analysis.get("model_id"), analysis.get("model_sha256"))
+        response = {"product": PRODUCT, "version": VERSION, "running": running,
+                      "stopping": stopping, "stopped": stopped, "mode": mode, "error": error,
+                      "tracker": tracker, "frame": frame, "metrics": metrics,
+                      "force": force, "sync": sync,
+                      "recording": recording and running,
+                      "force_error": force_error,
+                      "force_connected": bool(running and not stopped and not force_stopped and force_diagnostics.get("connected")),
+                      "force_connecting": bool(force_worker and force_worker.is_alive() and force_source and not force_diagnostics.get("connected") and not force_stopped),
+                      "force_diagnostic_history": force_history,
+                      "acquisition_timing": {key: value.diagnostics() for key, value in acquisition_timing},
+                      "devices": device_diagnostics,
+                      "experiment": experiment, "analysis": analysis, "validation": validation,
+                      "data_number": self.data_numbers.snapshot(experiment),
+                      "session": writer.status() if writer and recording else None}
+        response = clean(response)
+        # The source copies can age while a report is being formatted. Recheck
+        # the response after all expensive copying, without changing acquisition
+        # timestamps or borrowing a newer frame's freshness for an older value.
+        now = time.perf_counter_ns()
+        if frame:
+            stamp = frame.get("host_rx_monotonic_ns") if mode == "hardware" else received_ns
+            age = max(0, (now-stamp)/1e6) if type(stamp) is int and stamp > 0 else None
+            shown_tracker = response["tracker"]
+            shown_tracker["display_age_ms"] = age
+            if reference_changed or age is None or age > 1000 or not running or stopped:
+                shown_tracker["display_stale"] = True
+                for peak in shown_tracker.get("peaks", []):
+                    peak.update(valid=False, stale=True, age_ms=max(age or 0, peak.get("age_ms") or 0))
+                    peak["failure_reason"] = ("该光谱拟合使用旧参考；等待本次参考的处理结果" if reference_changed else
+                        peak.get("failure_reason") or "采集已停止或光谱超过 1 秒未更新")
+        shown_force = response.get("force")
+        prediction = response["analysis"].get("prediction", {})
+        if shown_force:
+            shown_force["age_ms"] = max(0, (now-shown_force["host_rx_monotonic_ns"])/1e6)
+            shown_force["stale"] = (shown_force.get("stale") is True or shown_force["age_ms"] > 250
+                                     or not running or stopped or force_stopped)
+            if shown_force["stale"]:
+                response["experiment"]["live_force"].update(valid=False, force_N=None,
+                    force_norm_N=None, wrench=None, reason="PX6D 源帧已过期或连接已停止，等待新鲜六轴数据")
+                prediction.update(comparison_ready=False, wrench_truth=None, wrench_error=None,
+                    truth_force_N=None, truth_force_norm_N=None, error_N=None)
+                prediction.pop("truth_context", None)
+                zero = response["analysis"].get("truth_zero", {})
+                if zero.get("ready") or zero.get("pending"):
+                    zero.update(ready=False, pending=False, offsets=None,
+                        reason="PX6D 已断开或过期；测试真值零点需重新确认")
+        if response["analysis"].get("model_kind") == "spectral_gru":
+            # Nine-peak fitting can lag the raw full-spectrum inference stream.
+            # Each prediction is checked against its own last source timestamp.
+            stamp = prediction.get("host_rx_monotonic_ns")
+            if type(stamp) is int:
+                age = (now-stamp)/1e6
+                prediction["age_ms"] = age
+                if age < 0 or age > 1000:
+                    prediction.update(valid=False, status="无效", point_id=None,
+                        comparison_ready=False, reason="推理末帧已过期，等待新的完整窗口")
+        elif response["tracker"].get("display_stale") and response["analysis"].get("inference_active"):
+            prediction.update(valid=False, status="无效", point_id=None, force_N=None,
+                raw_force_N=None, contact=False, comparison_ready=False, truth_force_N=None,
+                error_N=None, reason="当前九峰源帧已过期，等待新鲜光谱处理结果")
+            prediction.pop("truth_context", None)
+        return response

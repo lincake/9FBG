@@ -59,7 +59,7 @@ def test_no_directory_or_success_claim_before_explicit_valid_capture(tmp_path):
     assert snapshot["pending_sample"] is None and snapshot["stats"]["judged_total"] == 0
     for field in ("position_rate", "force_rate", "joint_rate", "mae_N", "rmse_N", "MAE_N", "RMSE_N"):
         assert snapshot["stats"][field] is None
-    assert snapshot["stats"]["status"] == "尚未实机验证" and not snapshot["formal_ready"]
+    assert snapshot["stats"]["status"] == "尚无模型推理判断" and not snapshot["formal_ready"]
     assert snapshot["model_checksum"] == SHA_A and snapshot["force_tolerance_N"] == 0.3
     assert store.configure(SHA_A, "M-a")["validation_session_id"] == snapshot["validation_session_id"]
 

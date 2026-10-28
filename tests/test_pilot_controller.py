@@ -134,7 +134,10 @@ def test_real_archive_checks_and_worker_save_separate_pilot_without_changing_liv
     assert aligned.parent.name == response["job_id"]
     assert len(aligned.read_text(encoding="utf-8").splitlines()) == 180
     assert json.loads((aligned.parent / "report.json").read_text(encoding="utf-8")) == report
-    assert {item["model_id"] for item in controller.models()} == {"Mexisting", report["pilot_model_id"]}
+    # The historical opaque fixture is deliberately not a valid model. The
+    # validated catalog excludes it while the preservation checks above still
+    # require its bytes and the active in-memory instance to remain untouched.
+    assert {item["model_id"] for item in controller.models()} == {report["pilot_model_id"]}
     # Building still preserves M; only a later explicit load activates P and
     # clears the old reference authorization for new independent live testing.
     loaded = controller.load(report["pilot_model_id"])
@@ -213,7 +216,8 @@ def test_failed_guided_round_cannot_supply_the_third_trial(tmp_path, monkeypatch
 @contextmanager
 def pilot_http(controller):
     service = SimpleNamespace(root=Path(__file__).resolve().parents[1], analysis=controller, command_lock=threading.RLock(),
-                              analysis_load=controller.load)
+                              analysis_load=controller.load,
+                              models_snapshot=lambda: {"models": controller.models()})
     server = LocalServer(("127.0.0.1", 0), partial(Handler, service=service))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

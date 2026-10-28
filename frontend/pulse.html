@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <title>9FBG · 脉搏测量</title>
+  <link rel="stylesheet" href="/style.css?version=0.18.0">
+  <link rel="stylesheet" href="/pulse.css?version=0.18.0">
+  <script src="/gui_priority.js?version=0.18.0" defer></script>
+  <script src="/pulse_signal.js?version=0.18.0" defer></script>
+  <script src="/pulse.js?version=0.18.0" defer></script>
+</head>
+<body>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="脉搏测量导航">
+      <a class="brand" href="/?version=0.18.0"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span><span>9FBG <small>0.18.0</small></span></a>
+      <div class="product-description">九光栅 · 中心点脉搏观察</div>
+      <div class="sidebar-divider"></div>
+      <a class="button secondary pulse-nav" href="/?version=0.18.0">← 返回采集工作台</a>
+      <div class="pulse-sidebar-help"><strong>FBG5 · 中心参考</strong><div class="contact-diagram" aria-label="FBG5 离中心最近，将脉搏位置轻贴中心附近"><span>指尖</span><div class="sensor-finger"><i></i></div><span>中心附近 · FBG5</span></div><p>FBG5 是你确认的最靠近中心的光栅。先移开接触物记录噪声，再将人体指腹或腕部的脉搏位置轻贴中心附近。</p><p>允许自然微动；明显移动时暂缓周期判断，稳定后自动恢复，沿用原权重。</p></div>
+      <div class="sidebar-footer"><span class="status-dot" id="pulseServerDot"></span><span id="pulseServerStatus">正在连接本机服务</span><small>源码开发版 · 本地处理</small></div>
+    </aside>
+    <main>
+      <header class="topbar"><div class="breadcrumb">工作台 <span>/</span> <strong>脉搏测量</strong></div><span class="mode-badge">研究观察</span></header>
+      <div class="main-content">
+        <section class="page-heading"><div><div class="eyebrow">无负载噪声定权 · FBG5 中心优先</div><h1>录一次噪声，持续看曲线</h1><p>记录 10 s 无负载噪声后，自动持续显示一条合成曲线，随时放手上去观察。</p></div></section>
+        <div id="pulseServiceNotice" class="notice" role="status">请先在工作台手动连接光谱；首次使用可在本页确认无载并初始化九峰参考。无需连接 PX6D。</div>
+        <section class="panel pulse-flow" aria-label="测量步骤">
+          <div class="pulse-step"><span class="pulse-step-number">01</span><h2>记录 10 s 无负载</h2><p>移开手指和其他接触物，保持无负载。短时掉速继续记录，自动补足真实有效时间和样本数，完成时间可能稍长。</p><label class="confirmation"><input type="checkbox" id="pulseUnloaded"><span>已移开接触物，确认当前无载荷</span></label><button class="button secondary" id="pulseReferenceBtn" disabled hidden>首次使用 · 初始化九峰参考</button><button class="button primary" id="pulseNoiseBtn" disabled>录制无负载 · 有效 10 s</button></div>
+          <div class="pulse-step"><span class="pulse-step-number">02</span><h2>自动固定噪声权重</h2><p>记录完成后自动计算。噪声小的光栅增加贡献；FBG5 作为中心主路，权重至少占 50%。</p><strong id="pulseWeightSummary" class="pulse-weight-summary">等待无负载噪声</strong><small>无须笔头点压或贴着人体学习。权重只计算一次，测量时不重算。</small></div>
+          <div class="pulse-step"><span class="pulse-step-number">03</span><h2>持续观察 · 随时上手</h2><p>噪声完成后曲线自动滚动。随时将脉搏位置放在 FBG5 附近，放上或移开都沿用原权重。</p><label class="confirmation"><input type="checkbox" id="pulseFreezeOthers" checked><span>曲线优先刷新，冻结其他 9FBG 界面</span></label><small id="pulsePriorityStatus" role="status">仅暂停其他页面显示，设备采集继续。</small><button class="button secondary" id="pulseMonitorBtn" disabled>暂停曲线 · 保留权重</button><button class="button subtle" id="pulseResetBtn">重新采集噪声</button><small>移动时曲线保留，稳定后恢复周期判断。本页权重在参考改变或刷新后需重新获取。</small></div>
+        </section>
+        <section class="pulse-status-line" aria-live="polite"><strong id="pulsePhase">等待设备与九峰参考</strong><span id="pulseReason">尚未采集</span><span id="pulseTiming"></span><progress id="pulseProgress" value="0" max="1" aria-label="当前步骤进度"></progress></section>
+        <section class="metric-grid pulse-metrics" aria-label="脉搏信号指标">
+          <div class="metric-card"><span>候选周期频率</span><strong id="pulseBpm">— <small>次/分</small></strong><div>仅在信号质量通过时显示</div></div>
+          <div class="metric-card"><span>实际有效提峰率</span><strong id="pulseRate">— <small>Hz</small></strong><div>按源时间计算 · 周期判断需 ≥ 20 Hz</div></div>
+          <div class="metric-card"><span>合成等效漂移</span><strong id="pulseValue">— <small>pm</small></strong><div id="pulseBandMetric">固定权重 · 0.7～3 Hz 带通</div></div>
+          <div class="metric-card"><span>信号状态</span><strong id="pulseQuality">等待</strong><div id="pulseWeightVersion">尚无固定权重</div></div>
+        </section>
+        <section class="panel pulse-chart-panel"><div class="panel-header"><div><span class="panel-index" id="pulseCurveKind">合成曲线</span><h2 id="pulseChartTitle">中心点脉搏趋势</h2></div><label class="pulse-window-label">显示窗口 <select id="pulseWindow"><option value="15">最近 15 s</option><option value="30" selected>最近 30 s</option><option value="60">最近 60 s</option></select></label></div><canvas id="pulseChart" role="img" aria-label="九路光栅按无负载噪声固定加权的合成曲线，FBG5 中心优先，等效漂移单位 pm，相对源接收时间单位 s"></canvas><form id="pulseFilterForm" class="pulse-filter-controls" aria-label="合成曲线带通滤波设置" novalidate>
+          <div class="pulse-filter-heading"><strong>带通滤波</strong><span id="pulseFilterCurrent">当前频带 0.7～3 Hz</span></div>
+          <div class="pulse-filter-fields"><label for="pulseBandLow">下限 / Hz<input id="pulseBandLow" type="number" min="0.1" max="8" step="0.1" value="0.7" inputmode="decimal"></label><span class="pulse-filter-range-separator" aria-hidden="true">～</span><label for="pulseBandHigh">上限 / Hz<input id="pulseBandHigh" type="number" min="0.1" max="8" step="0.1" value="3" inputmode="decimal"></label><button id="pulseFilterApply" type="button" class="button secondary">应用频带 · 需重录噪声</button></div>
+          <p id="pulseFilterStatus" class="pulse-filter-status" role="status" aria-live="polite">输入后点击应用；更改频带需重新录制无负载噪声，匹配这次频带的权重。</p>
+          <p id="pulseFilterHelp" class="pulse-filter-help">范围 0.1～8 Hz，下限须小于上限。设备采集继续运行。</p>
+        </form><p class="pulse-chart-note" id="pulseChartNote">噪声完成后持续显示 0.7～3 Hz 合成曲线。运动和缺帧处分段显示，预热段颜色较浅；稳定后恢复周期判断。</p></section>
+        <section class="panel pulse-weights-panel"><div class="panel-header"><div><span class="panel-index">九路贡献</span><h2>无负载噪声与固定权重</h2></div><span class="muted-caption">wᵢ ≥ 0 · Σ wᵢ = 1</span></div><div class="table-scroll"><table><thead><tr><th>光栅</th><th>固定权重</th><th>无负载带内噪声 / pm</th><th>测量角色</th></tr></thead><tbody id="pulseWeights"></tbody></table></div><div class="pulse-formula">50% 固定留给 FBG5，余下 50% 按九路带内噪声倒方差分配。合成信号 y(t) = Σ wᵢ · 带通[Δλᵢ(t) − bᵢ]，bᵢ 为无负载基线。噪声权重未标定各路机械响应的正负方向或灵敏度。</div></section>
+        <p class="pulse-limits">建议在连接前将采样请求设为 50～100 Hz，并以实际有效提峰率为准。当前设备缺少可核验的物理新帧编号；主机接收率不能证明物理采样率。周期性振动也可能产生候选频率，需与独立脉搏参考核对。本功能尚未经过真实人体脉搏对照验证。</p>
+        <footer class="page-footer"><span>9FBG 0.18.0 · 脉搏测量</span><span id="pulseServiceVersion">正在核对采集服务版本</span></footer>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

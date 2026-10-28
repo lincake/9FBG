@@ -1,12 +1,14 @@
 """Hardware-shaped storage fixtures test software; no physical qualification."""
 from copy import deepcopy
 import json
+import threading
 import time
 
 import numpy as np
 import pytest
 
 from ninefbg.analysis import AnalysisController, load_rows
+from ninefbg.capture_setup import SETUP_POLICY
 from ninefbg.experiment import coordinate_definition, default_point_grid
 from ninefbg.storage import SessionWriter
 from ninefbg.tracking import PeakTracker, ALGORITHM_VERSION
@@ -102,6 +104,26 @@ def test_rows_are_scoped_by_session_and_whole_bad_trials_are_removed(tmp_path):
         stream.write('{}\n')
     with pytest.raises(ValueError, match="哈希"):
         load_rows(tmp_path, [b.path.name])
+
+
+@pytest.mark.parametrize("policy", [None, SETUP_POLICY])
+def test_legacy_training_load_uses_recorded_setup_policy_and_keeps_sources_immutable(tmp_path, policy):
+    writer = session_fixture(tmp_path, "A", new_coordinates=True)
+    manifest_path = writer.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["settings"].update(force_direction_confirmed=False, coordinates_confirmed=False)
+    if policy is not None:
+        manifest["settings"]["setup_policy"] = policy
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    before = {file.name: file.read_bytes() for file in writer.path.iterdir()}
+    if policy is None:
+        with pytest.raises(ValueError, match="方向或点位确认"):
+            load_rows(tmp_path, [writer.path.name])
+    else:
+        rows, _ = load_rows(tmp_path, [writer.path.name])
+        assert len(rows) > 25
+        assert {row["point_id"] for row in rows if row["point_id"]} == {f"P{i:02d}" for i in range(1, 26)}
+    assert before == {file.name: file.read_bytes() for file in writer.path.iterdir()}
 
 
 def test_guided_rounds_need_explicit_passed_quality_even_if_marked_completed(tmp_path):
@@ -219,11 +241,73 @@ def test_pending_truth_zero_is_cancelled_by_disconnect_staleness_or_epoch(tmp_pa
 def runtime_fixture(tmp_path, monkeypatch):
     controller = AnalysisController(tmp_path)
     controller.bundle = {"algorithm_version": "test-algo", "config_version": "test-config"}
+    controller.inference_active = True
     tracker = {"algorithm_version": "test-algo", "config_version": "test-config", "stream_epoch": "optical-A",
                "reference_version": 2, "frame_id": 4, "host_rx_monotonic_ns": time.perf_counter_ns(),
                "peaks": [{"id": f"FBG{i}", "valid": True, "drift_nm": .01} for i in range(1, 10)]}
     monkeypatch.setattr("ninefbg.inversion.predict", lambda *args: {"status": "有效估计", "point_id": "P01", "force_N": 1})
     return controller, tracker
+
+
+def test_stop_discards_inflight_legacy_prediction_and_later_reads_never_predict(tmp_path, monkeypatch):
+    controller, tracker = runtime_fixture(tmp_path, monkeypatch)
+    authorize_test_reference(controller, tracker)
+    entered, release = threading.Event(), threading.Event()
+    calls, replies = [], []
+    def blocked_predict(*args):
+        calls.append(1)
+        entered.set()
+        assert release.wait(3)
+        return {"status": "有效估计", "point_id": "P01", "force_N": 1}
+    monkeypatch.setattr("ninefbg.inversion.predict", blocked_predict)
+    reader = threading.Thread(target=lambda: replies.append(controller.snapshot(tracker, source_kind="hardware")))
+    reader.start()
+    try:
+        assert entered.wait(2)
+        controller.stop_inference()
+    finally:
+        release.set()
+        reader.join(3)
+    assert not reader.is_alive()
+    assert not replies[0]["inference_active"]
+    assert replies[0]["prediction"]["status"] == "已结束"
+    assert replies[0]["prediction"]["point_id"] is replies[0]["prediction"]["force_N"] is None
+    for _ in range(5):
+        assert controller.snapshot(tracker, source_kind="hardware")["prediction"]["status"] == "已结束"
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match="重新载入"):
+        controller.request_truth_zero({})
+
+
+def test_stop_during_legacy_build_preserves_loaded_model_and_candidate_stays_offline(tmp_path, monkeypatch):
+    a, b = session_fixture(tmp_path, "A"), session_fixture(tmp_path, "B")
+    controller = AnalysisController(tmp_path)
+    controller.bundle = {"algorithm_version": "test-algo", "config_version": "test-config"}
+    controller.inference_active = True
+    controller.model_id = "Mprevious"
+    previous = deepcopy(controller.bundle)
+    entered, release = threading.Event(), threading.Event()
+    from ninefbg import inversion
+    actual_fit = inversion.fit_models
+    def delayed_fit(*args):
+        entered.set()
+        assert release.wait(3)
+        return actual_fit(*args)
+    monkeypatch.setattr(inversion, "fit_models", delayed_fit)
+    controller.start_job("build", [a.path.name, b.path.name], {"include_mlp": False})
+    try:
+        assert entered.wait(2)
+        controller.stop_inference()
+        assert controller.busy
+    finally:
+        release.set()
+    wait_job(controller)
+    assert not controller.inference_active and controller.model_id == "Mprevious"
+    assert controller.bundle == previous
+    candidate = controller.full_report()["model_id"]
+    assert candidate != "Mprevious" and (tmp_path/"models"/(candidate+".json")).is_file()
+    controller.load(candidate)
+    assert controller.inference_active and not controller.test_reference["ready"]
 
 
 def test_test_reference_requires_new_version_and_post_confirmation_valid_frame_without_px6d(tmp_path, monkeypatch):

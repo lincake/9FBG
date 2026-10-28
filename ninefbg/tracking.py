@@ -21,6 +21,8 @@ from scipy.signal import find_peaks, savgol_filter
 
 ALGORITHM_VERSION = "gaussian_background_fixed_identity_1.0.0"
 TEMPLATE_ALGORITHM_VERSION = "local_reference_spectrum_shift_1.0.0"
+AUTO_REFERENCE_SOURCE = "optical_connect_auto_v1"
+MANUAL_REFERENCE_SOURCE = "operator_unloaded_confirmation_v1"
 DEFAULT_CONFIG = {
     "sample_count": 512, "expected_peaks": 9,
     "stable_frames": 8, "prominence_noise_sigma": 6.0,
@@ -169,6 +171,8 @@ class PeakTracker:
         self._last_valid = {}
         self._stable = deque(maxlen=self.config["stable_frames"])
         self._pending_reference = False
+        self._pending_reference_source = None
+        self._pending_unloaded_confirmed = False
         self._press = False
         self._binding = None
         self._last_identity = None
@@ -188,9 +192,28 @@ class PeakTracker:
         if self._press:
             raise ValueError("一次按压期间参考冻结，请先结束按压并移开接触棒。")
         self._pending_reference = True
+        self._pending_reference_source = MANUAL_REFERENCE_SOURCE
+        self._pending_unloaded_confirmed = True
         self._stable.clear()
         self._event("无载确认", reference_version=self._reference_version,
+                    reference_source=MANUAL_REFERENCE_SOURCE, unloaded_confirmed=True,
                     purpose="回零" if self._anchors else "首次初始化")
+
+    def request_connection_reference(self) -> None:
+        """Queue one initial optical reference, without asserting no load.
+
+        AcquisitionService calls this once on a fresh hardware connection. A
+        changed binding or a completed request cannot silently request another
+        zero; the operator's explicit reference path remains independent.
+        """
+        if self._processed or self._binding is not None or self._pending_reference or self._reference_version:
+            raise ValueError("连接自动参考只能在本次光谱连接开始、尚未处理源帧时申请。")
+        self._pending_reference = True
+        self._pending_reference_source = AUTO_REFERENCE_SOURCE
+        self._pending_unloaded_confirmed = False
+        self._stable.clear()
+        self._event("光谱连接自动参考申请", reference_version=self._reference_version,
+                    reference_source=AUTO_REFERENCE_SOURCE, unloaded_confirmed=False)
 
     def begin_press(self) -> None:
         if not self._anchors or not self._reference:
@@ -212,6 +235,8 @@ class PeakTracker:
         self._last_valid.clear()
         self._stable.clear()
         self._pending_reference = False
+        self._pending_reference_source = None
+        self._pending_unloaded_confirmed = False
         self._press = False
         self._last_identity = self._last_time = self._last_device_sequence = None
 
@@ -341,6 +366,7 @@ class PeakTracker:
         return windows
 
     def _stable_frame(self, rows, frame):
+        label = "自动九峰参考" if self._pending_reference_source == AUTO_REFERENCE_SOURCE else "无载"
         if not all(row.get("valid") for row in rows) or len(rows) != 9:
             self._stable.clear()
             return False, "9 个峰必须连续有效，稳定计数已重置"
@@ -352,20 +378,23 @@ class PeakTracker:
             tolerance = self.config["stable_center_samples"] * self._axis_diag["median_step_nm"]
             if np.max(np.abs(centers - np.median(prior_centers, axis=0))) > tolerance:
                 self._stable.clear()
-                return False, "无载峰心仍在变化，稳定计数已重置"
+                return False, f"{label}峰心仍在变化，稳定计数已重置"
             if np.max(np.abs(amplitudes - np.median(prior_amplitudes, axis=0)) / np.maximum(np.median(prior_amplitudes, axis=0), 1e-12)) > self.config["stable_amplitude_fraction"]:
                 self._stable.clear()
-                return False, "无载峰幅仍在变化，稳定计数已重置"
+                return False, f"{label}峰幅仍在变化，稳定计数已重置"
         self._stable.append({"centers": centers.tolist(), "amplitudes": amplitudes.tolist(),
                              "frame_id": deepcopy(frame.get("frame_id")),
                              "host_rx_monotonic_ns": frame.get("host_rx_monotonic_ns")})
-        return len(self._stable) == self.config["stable_frames"], f"无载稳定帧 {len(self._stable)}/{self.config['stable_frames']}"
+        return len(self._stable) == self.config["stable_frames"], f"{label}稳定帧 {len(self._stable)}/{self.config['stable_frames']}"
 
     def _commit_reference(self, frame, initialization):
         self._reference = np.median(np.asarray([item["centers"] for item in self._stable]), axis=0).tolist()
         self._reference_version += 1
         entry = {"version": self._reference_version, "utc": datetime.now(timezone.utc).isoformat(),
-                 "action": "首次初始化" if initialization else "无载回零", "unloaded_confirmed": True,
+                 "action": ("连接自动九峰参考" if self._pending_reference_source == AUTO_REFERENCE_SOURCE
+                            else "首次初始化" if initialization else "无载回零"),
+                 "reference_source": self._pending_reference_source,
+                 "unloaded_confirmed": self._pending_unloaded_confirmed,
                  "reference_nm": deepcopy(self._reference), "identity_anchor_nm": deepcopy(self._anchors),
                  "frame_ids": [deepcopy(item["frame_id"]) for item in self._stable],
                  "stable_frame_count": len(self._stable), "stream_epoch": deepcopy(frame.get("stream_epoch")),
@@ -375,6 +404,8 @@ class PeakTracker:
         self._event("参考更新", reference=entry)
         self._stable.clear()
         self._pending_reference = False
+        self._pending_reference_source = None
+        self._pending_unloaded_confirmed = False
 
     def process(self, frame: dict) -> dict:
         started = time.perf_counter_ns()
@@ -400,6 +431,8 @@ class PeakTracker:
             if str(frame.get("phase", "")) in {"press", "loading", "holding", "按压", "加载", "保持"} and not self._press:
                 if self._pending_reference:
                     self._pending_reference = False
+                    self._pending_reference_source = None
+                    self._pending_unloaded_confirmed = False
                     self._stable.clear()
                     self._event("无载参考取消", reason="初始化或回零未完成就进入按压阶段，必须重新确认无载")
                 raise ValueError("按压阶段未通过开始条件；本帧拒绝用于提峰或建立参考，请结束按压并重新确认无载。")
@@ -489,13 +522,16 @@ class PeakTracker:
                     ready, message = self._stable_frame(rows, frame)
                     result.update(state="initializing", message=message, peaks=rows)
                     if ready:
+                        automatic = self._pending_reference_source == AUTO_REFERENCE_SOURCE
                         self._anchors = [row["center_nm"] for row in rows]
                         self._windows = self._make_windows(axis, rows)
                         self._commit_reference(frame, True)
                         for index, row in enumerate(rows):
                             row.update(id=f"FBG{index + 1}", drift_nm=row["center_nm"] - self._reference[index], value_frame_id=deepcopy(frame.get("frame_id")))
                             self._last_valid[index] = {"row": deepcopy(row), "timestamp": stamp, "frame_id": deepcopy(frame.get("frame_id"))}
-                        result.update(state="tracking", message="9 个主峰已稳定初始化，FBG1～FBG9 身份固定。", peaks=rows)
+                        message = ("9 个主峰已稳定建立连接自动参考，FBG1～FBG9 身份固定；未作无载确认。"
+                                   if automatic else "9 个主峰已稳定初始化，FBG1～FBG9 身份固定。")
+                        result.update(state="tracking", message=message, peaks=rows)
             else:
                 rows = []
                 peak_started = time.perf_counter_ns()
@@ -543,7 +579,10 @@ class PeakTracker:
                       reference_nm=deepcopy(self._reference), press_active=self._press, reference_frozen=self._press,
                       stable_frame_count=len(self._stable), stable_frame_required=self.config["stable_frames"],
                       drift_range_verified=self.config["confirmed_drift_nm"] is not None,
-                      reference_pending=self._pending_reference)
+                      reference_pending=self._pending_reference,
+                      pending_reference_source=self._pending_reference_source,
+                      reference_source=self._reference_history[-1].get("reference_source") if self._reference and self._reference_history else None,
+                      reference_unloaded_confirmed=self._reference_history[-1].get("unloaded_confirmed", False) if self._reference and self._reference_history else False)
         result["processing_ms"] = (time.perf_counter_ns() - started) / 1e6
         result["peak_processing_ms"] = peak_processing_ns / 1e6
         self._durations.append(result["processing_ms"])
@@ -558,9 +597,13 @@ class PeakTracker:
                    "rate_note": "设备序号用于辨别新帧" if self._last_device_sequence is not None else "缺少设备帧身份，仅报告主机接收率；不能证明新光谱率",
                    "processing_mean_ms": float(np.mean(self._durations)) if self._durations else None,
                    "processing_p95_ms": float(np.percentile(self._durations, 95)) if self._durations else None}
-        return {"initialized": bool(self._anchors), "state": self._latest.get("state") if self._latest else "awaiting_confirmation",
-                "message": self._latest.get("message") if self._latest else "等待实际光谱及无载确认。",
+        waiting_auto = self._pending_reference_source == AUTO_REFERENCE_SOURCE
+        return {"initialized": bool(self._anchors), "state": self._latest.get("state") if self._latest else "initializing" if waiting_auto else "awaiting_confirmation",
+                "message": self._latest.get("message") if self._latest else "等待本次连接的稳定光谱，自动建立九峰参考。" if waiting_auto else "等待实际光谱及无载确认。",
                 "reference_pending": self._pending_reference, "press_active": self._press,
+                "pending_reference_source": self._pending_reference_source,
+                "reference_source": self._reference_history[-1].get("reference_source") if self._reference and self._reference_history else None,
+                "reference_unloaded_confirmed": self._reference_history[-1].get("unloaded_confirmed", False) if self._reference and self._reference_history else False,
                 "reference_frozen": self._press, "reference_version": self._reference_version,
                 "algorithm_version": self.algorithm_version, "config_version": self.config_version,
                 "windows": deepcopy(self._windows), "reference_nm": deepcopy(self._reference),

@@ -77,12 +77,18 @@ def _ready(evidence, name):
 
 
 def _inference_valid(prediction):
+    from .spectral_validation import is_spectral, inference_valid
+    if is_spectral(prediction):
+        return inference_valid(prediction)
     return (isinstance(prediction, dict) and prediction.get("status") == "有效估计"
             and isinstance(prediction.get("point_id"), str) and prediction["point_id"] in _POINTS
             and all(_finite(prediction.get(key)) for key in ("force_N", "error_N")))
 
 
 def _display_prediction(prediction):
+    from .spectral_validation import is_spectral
+    if is_spectral(prediction):
+        return deepcopy(prediction)
     displayed = deepcopy(prediction)
     if not _inference_valid(prediction):
         # Retain all raw model output in evidence, but never present a rejected
@@ -93,6 +99,9 @@ def _display_prediction(prediction):
 
 
 def _validated(evidence, *, check_clock=True):
+    from .spectral_validation import is_spectral, validated
+    if is_spectral(evidence):
+        return validated(evidence, check_clock)
     if not isinstance(evidence, dict):
         raise ValueError("人工验收缺少服务端冻结证据")
     value = deepcopy(evidence)
@@ -198,6 +207,9 @@ def _validated(evidence, *, check_clock=True):
 
 
 def _judgment_values(sample, position_correct, force_correct, actual_point_id):
+    from .spectral_validation import is_spectral, judgment_values
+    if is_spectral(sample):
+        return judgment_values(sample, position_correct, force_correct, actual_point_id)
     if type(position_correct) is not bool or type(force_correct) is not bool:
         raise ValueError("位置与力判断必须由操作者明确选择真或假")
     if actual_point_id is not None and (not isinstance(actual_point_id, str) or actual_point_id not in _POINTS):
@@ -278,12 +290,24 @@ class ValidationController:
             raise ValueError("请先加载模型，再进行人工实机验收")
 
     def _identity(self, evidence):
+        if evidence.get("schema") == "spectral_validation_evidence_v1":
+            return _canonical({key: evidence[key] for key in ("frame_id", "optical_epoch", "force_epoch", "reference_id", "zero_id", "model_checksum")}).decode("utf-8")
         return _canonical({key: evidence[key] for key in _CONTEXT_KEYS}).decode("utf-8")
 
     def _pending(self, checksum, session_id=None):
         return [sample for sample_id, sample in self.samples.items()
                 if sample["model_checksum"] == checksum and (session_id is None or sample["validation_session_id"] == session_id)
                 and sample_id not in self.judgments and sample_id not in self.discarded]
+
+    def has_pending(self):
+        with self.lock:
+            return any(value not in self.judgments and value not in self.discarded for value in self.samples)
+
+    def detach_model(self):
+        with self.lock:
+            if self.has_pending():
+                raise ValueError("请先保存本次判断或选择重新判断，再管理模型")
+            self.model_checksum = self.model_id = self.validation_session_id = None
 
     def capture(self, evidence):
         with self.lock:
@@ -308,16 +332,20 @@ class ValidationController:
                 created = _utc()
                 inference_valid = _inference_valid(value["prediction"])
                 prediction = _display_prediction(value["prediction"])
+                from .spectral_validation import is_spectral, sample_fields
+                spectral = is_spectral(value)
                 sample = {"sample_id": "V" + uuid.uuid4().hex, "valid": True, "reason": None,
                           "comparison_ready": True, "inference_valid": inference_valid,
                           "model_id": self.model_id, "model_checksum": self.model_checksum, "model_sha256": self.model_checksum,
                           "validation_session_id": self.validation_session_id, "session_id": self.validation_session_id,
                           "created_utc": created, "reference_version": value["reference_version"],
                           "target_point_id": value.get("target_point_id"), "actual_point_id": value.get("target_point_id"),
-                          "prediction": prediction, "absolute_error_N": abs(prediction["error_N"]) if inference_valid else None,
+                          "prediction": prediction, "absolute_error_N": abs(prediction["error_N"]) if inference_valid and not spectral else None,
                           "force_tolerance_N": FORCE_TOLERANCE_N, "evidence_sha256": _digest(value),
                           "raw_force_available": bool(value.get("force_source_frames")),
                           "evidence": value}
+                if spectral:
+                    sample.update(sample_fields(value))
                 self._append("freeze", {"sample": sample})
                 return deepcopy(sample)
             except (ValueError, TypeError) as exc:
@@ -375,6 +403,10 @@ class ValidationController:
                             "position_correct": judgment["position_correct"],
                             "force_correct": judgment["force_correct"], "source": "operator",
                             "evidence_sha256": sample["evidence_sha256"]})
+            if sample.get("schema") == "spectral_manual_sample_v1":
+                for key in ("wrench_pred", "wrench_truth", "wrench_error", "axes", "units"):
+                    records[-1][key] = deepcopy(prediction.get(key))
+                records[-1]["wrench_tolerances"] = deepcopy(sample["wrench_tolerances"])
         return records
 
     def _report_view(self, report):
@@ -419,6 +451,9 @@ class ValidationController:
                       "stats": stats, "records": self._report_records(self.model_checksum, sid),
                       "source_head_sha256": self.sessions[sid]["head"],
                       "scope": "operator_saved_live_press_judgments_only", "formal_ready": False}
+            if any(sample.get("schema") == "spectral_manual_sample_v1" and sample["model_checksum"] == self.model_checksum for sample in self.samples.values()):
+                report.update(schema="9fbg_spectral_manual_validation_report_v1", force_tolerance_N=None,
+                              wrench_tolerance_policy="per_frozen_sample", axes=_AXES, units=_UNITS)
             report["report_sha256"] = _digest(report)
             self._append("finish", {"report": report})
             self._write_report(report)
@@ -452,7 +487,7 @@ class ValidationController:
             raise ValueError("同一人工验收会话不能混入不同模型")
         kind = event["event"]
         if sid in self.reports:
-            raise ValueError("已结束的实机验证会话不能追加或更改判断")
+            raise ValueError("已结束的模型推理判断会话不能追加或更改判断")
         if kind == "freeze":
             sample = deepcopy(event["sample"])
             if replay:
@@ -460,12 +495,17 @@ class ValidationController:
             if sample["model_checksum"] != checksum or sample["validation_session_id"] != sid or sample["evidence_sha256"] != _digest(sample["evidence"]):
                 raise ValueError("冻结样本与保存证据身份不一致")
             inference_valid = _inference_valid(sample["evidence"]["prediction"])
-            absolute_error = abs(sample["evidence"]["prediction"]["error_N"]) if inference_valid else None
+            from .spectral_validation import is_spectral, sample_fields
+            spectral = is_spectral(sample["evidence"])
+            absolute_error = abs(sample["evidence"]["prediction"]["error_N"]) if inference_valid and not spectral else None
             target = sample["evidence"].get("target_point_id")
             if sample.get("target_point_id") != target or sample.get("actual_point_id") != target:
                 raise ValueError("冻结目标点位与保存证据不一致")
-            if sample.get("valid") is not True or sample["prediction"] != _display_prediction(sample["evidence"]["prediction"]) or sample["reference_version"] != sample["evidence"]["reference_version"] or sample["absolute_error_N"] != absolute_error or sample.get("force_tolerance_N") != FORCE_TOLERANCE_N or sample.get("inference_valid", inference_valid) is not inference_valid or sample.get("comparison_ready", True) is not True:
+            tolerance = None if spectral else FORCE_TOLERANCE_N
+            if sample.get("valid") is not True or sample["prediction"] != _display_prediction(sample["evidence"]["prediction"]) or sample["reference_version"] != sample["evidence"]["reference_version"] or sample["absolute_error_N"] != absolute_error or sample.get("force_tolerance_N") != tolerance or sample.get("inference_valid", inference_valid) is not inference_valid or sample.get("comparison_ready", True) is not True:
                 raise ValueError("冻结显示值与保存证据不一致")
+            if spectral and any(sample.get(key) != value for key, value in sample_fields(sample["evidence"]).items()):
+                raise ValueError("六维冻结显示值或容差与保存证据不一致")
             # Enrich only in memory when reading earlier valid freeze records.
             sample.setdefault("inference_valid", inference_valid)
             sample.setdefault("comparison_ready", True)
@@ -494,18 +534,20 @@ class ValidationController:
         elif kind == "finish":
             report = deepcopy(event["report"])
             expected_digest = _digest({key: value for key, value in report.items() if key != "report_sha256"})
-            if (report.get("schema") != "9fbg_manual_validation_report_v1"
+            spectral_report = report.get("schema") == "9fbg_spectral_manual_validation_report_v1"
+            if (report.get("schema") not in {"9fbg_manual_validation_report_v1", "9fbg_spectral_manual_validation_report_v1"}
                     or report.get("report_sha256") != expected_digest
                     or report.get("session_id") != sid or report.get("model_sha256") != checksum
                     or report.get("model_id") != session["model_id"]
                     or report.get("source_head_sha256") != session["head"]
                     or report.get("stats") != self._result_stats(checksum, sid)
                     or not report["stats"]["judged_total"] or self._pending(checksum)
-                    or report.get("force_tolerance_N") != FORCE_TOLERANCE_N
+                    or report.get("force_tolerance_N") != (None if spectral_report else FORCE_TOLERANCE_N)
+                    or spectral_report and (report.get("wrench_tolerance_policy") != "per_frozen_sample" or report.get("axes") != _AXES or report.get("units") != _UNITS)
                     or report.get("scope") != "operator_saved_live_press_judgments_only"
                     or report.get("formal_ready") is not False
                     or report.get("records") != self._report_records(checksum, sid)):
-                raise ValueError("实机验证结果与已保存的人工判断不一致")
+                raise ValueError("模型推理判断报告与已保存的人工判断不一致")
             self.reports[sid] = report
         else:
             raise ValueError("人工验收日志包含未知事件")
@@ -532,12 +574,18 @@ class ValidationController:
         scale = max((abs(error) for error in errors), default=0)
         mae = scale * (math.fsum(abs(error)/scale for error in errors)/error_count) if scale else 0.0 if error_count else None
         rmse = scale * math.sqrt(math.fsum((error/scale)**2 for error in errors)/error_count) if scale else 0.0 if error_count else None
-        return {"judged_total": total, "position_correct": position, "force_correct": force, "joint_correct": joint,
+        result = {"judged_total": total, "position_correct": position, "force_correct": force, "joint_correct": joint,
                 "inference_rejected": rejected, "force_error_count": error_count,
                 "position_rate": position / total if total else None, "force_rate": force / total if total else None,
                 "joint_rate": joint / total if total else None, "mae_N": mae, "rmse_N": rmse, "MAE_N": mae, "RMSE_N": rmse,
                 "pending_count": len(self._pending(checksum, session_id)), "invalid_count": self._invalid.get(checksum, 0),
-                "status": "已记录人工实机验收" if total else "尚未实机验证"}
+                "status": "已记录人工实机验收" if total else "尚无模型推理判断"}
+        six = [self.samples[item]["prediction"]["wrench_error"] for item in ids if self.samples[item].get("schema") == "spectral_manual_sample_v1"]
+        if six:
+            result.update(wrench_error_count=len(six), axes=_AXES, units=_UNITS,
+                          wrench_mae=[sum(abs(row[i]) for row in six)/len(six) for i in range(6)],
+                          wrench_rmse=[math.sqrt(sum(row[i]**2 for row in six)/len(six)) for i in range(6)])
+        return result
 
     def snapshot(self, model_id=None, model_sha256=None, session_id=None, *, model_checksum=None):
         with self.lock:
@@ -561,11 +609,12 @@ class ValidationController:
                      and (session_id is None or self.samples[sample_id]["validation_session_id"] == session_id)]
             reports = [report for report in self.reports.values() if report["model_sha256"] == checksum]
             latest_report = max(reports, key=lambda row: (row["created_utc"], row["session_id"])) if reports else None
+            spectral = any(item.get("schema") == "spectral_manual_sample_v1" and item["model_checksum"] == checksum for item in self.samples.values())
             return {"schema": SCHEMA, "model_id": model_id if model_id is not None else self.model_id if checksum == self.model_checksum else sample.get("model_id") if sample else None,
                     "model_checksum": checksum, "model_sha256": checksum, "validation_session_id": sid, "session_id": sid,
                     "pending_sample": sample, "stats": self._stats(checksum, session_id),
                     "session_stats": self._stats(checksum, sid) if sid else None,
                     "finished": sid in self.reports, "latest_report": self._report_view(latest_report),
                     "last_saved_sample_id": saved[-1] if saved else None, "error": self.error,
-                    "force_tolerance_N": FORCE_TOLERANCE_N, "formal_ready": False,
+                    "force_tolerance_N": None if spectral else FORCE_TOLERANCE_N, "formal_ready": False,
                     "stats_scope": "validation_session" if session_id is not None else "model_checksum_all_sessions"}

@@ -1,7 +1,7 @@
 (function (global) {
   "use strict";
   const display = global.NineFBGDisplay || (typeof require === "function" ? require("./display.js") : null);
-  const COLORS = ["#efba7b", "#81cab5", "#88b8e9", "#c7a2df", "#e69d9d", "#b9c77b", "#80c6d4", "#d99cba", "#b7b8ec"];
+  const COLORS = ["#a86408", "#087f6b", "#246bc1", "#8a49b3", "#c04448", "#6b7a0d", "#087d98", "#b23d7d", "#5a59ac"];
   const IDS = Array.from({ length: 9 }, (_, index) => `FBG${index + 1}`);
   const finite = value => typeof value === "number" && Number.isFinite(value);
   const numeric = value => finite(value) ? value : null;
@@ -110,15 +110,27 @@
       readStatus: [optical.last_sdk_warning, optical.last_error, force.last_error].filter(Boolean).join("；") || (state.running ? "按请求采集；实际接收率见实时指标" : "采集未启动")
     };
   }
-  const api = { COLORS, IDS, finite, fmt, escapeHTML, label, normalizeID, normalizePeaks, windowBounds, parseReplay, quality, gates, comparisonRows, devicePresentation };
+  function captureDisplayActive(state) {
+    return state?.experiment?.running === true || state?.recording === true;
+  }
+  const api = { COLORS, IDS, finite, fmt, escapeHTML, label, normalizeID, normalizePeaks, windowBounds, parseReplay, quality, gates, comparisonRows, devicePresentation, captureDisplayActive };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   global.NineFBG = api;
   if (typeof document === "undefined") return;
 
   const $ = id => document.getElementById(id);
+  const UI_VERSION = $("version").dataset.uiVersion;
   let state = { running: false, tracker: {}, metrics: {} }, busy = false, polling = false, active = true;
   let lastError = "", noticeTimer = null, rawGeometry = null, stateReceivedAt = Date.now();
   let lastPeakRenderKey = null, lastSpectrumRenderKey = null;
+  let displayFreeze = null, serviceUnavailable = false;
+  const guiPriority = global.NineFBGGuiPriority?.shared();
+  let guiNeedsFreshState = guiPriority?.isFrozen() === true;
+  let guiStateEpoch = 0;
+  const guiFrozen = () => guiPriority?.isFrozen() === true;
+  const guiPaused = () => guiFrozen() || guiNeedsFreshState;
+  const wavelengthChart = global.NineFBGWavelengthChart?.mount({ canvas: $("expWavelengthChart"), status: $("expWavelengthStatus"), legend: $("expWavelengthLegend"), windowSelect: $("expWavelengthWindow"), global,
+    visible: () => !guiPaused() && global.document.hidden !== true && $("expWavelengthChart").getBoundingClientRect().width > 0 });
   const forceZero = new display.DisplayZero();
   let forceSample = null;
   let spectrumView = null, restoredSpectrumView = null;
@@ -128,6 +140,48 @@
     const force = state.force && { ...state.force, age_ms: finite(state.force.age_ms) ? state.force.age_ms + Math.max(0, Date.now() - stateReceivedAt) : state.force.age_ms };
     return display.normalizeForce(force, { running: state.running === true,
       connected: state.force_connected ?? device?.connected ?? !!state.force });
+  }
+  function displayHeld() { return guiPaused() || displayFreeze?.painted === true; }
+  function renderGuiPriority() {
+    $("guiPriorityNotice").hidden = !guiPaused();
+    put("guiPriorityMessage", guiFrozen() ? "脉搏曲线优先 · 本页显示与状态刷新已暂停。当前读数为暂停前快照；后台采集、保存与训练继续。" : "正在恢复本页显示 · 等待最新设备状态，当前读数仍为暂停前快照。");
+    $("guiPriorityResume").disabled = !guiFrozen();
+    if (guiPaused()) {
+      $("spectrumTooltip").hidden = true;
+      put("runningBadge", guiFrozen() ? "脉搏曲线优先 · 本页显示已暂停" : "正在获取最新状态");
+      put("serverStatus", guiFrozen() ? "本页状态刷新已暂停" : "正在获取最新状态");
+    }
+  }
+  function updateDisplayFreeze() {
+    if (captureDisplayActive(state)) {
+      if (!displayFreeze) {
+        displayFreeze = { painted: false, frame: state.frame?.frame_id ?? "—", reference: gates(state, false, false, busy).referenced ? state.tracker.reference_version : "未建立", time: new Date().toLocaleTimeString("zh-CN", { hour12: false }) };
+        $("spectrumTooltip").hidden = true;
+      }
+    } else if (displayFreeze) {
+      displayFreeze = null;
+      // A completed session may retain its last IDs; always resume from the
+      // latest state, even if those IDs match the captured display snapshot.
+      lastPeakRenderKey = lastSpectrumRenderKey = null;
+      rawGeometry = null;
+      $("spectrumTooltip").hidden = true;
+    }
+  }
+  function renderDisplayFreezeStatus() {
+    const frozen = !!displayFreeze;
+    $("captureDisplayNotice").hidden = !frozen;
+    $("peakDisplayStatus").hidden = !frozen;
+    $("liveDisplayPanel").classList.toggle("display-frozen", frozen);
+    put("frameLabel", frozen ? "冻结原始帧" : "当前原始帧");
+    if (!frozen) return;
+    put("captureDisplaySnapshot", `冻结于 ${displayFreeze.time} · 原始帧 ${displayFreeze.frame} · 九峰参考 ${displayFreeze.reference === "未建立" ? "未建立" : "第 " + displayFreeze.reference + " 版"}`);
+    put("peakDisplayStatus", "显示已冻结 · 表中为采集开始时的快照");
+    const elapsed = Math.max(0, Date.now() - stateReceivedAt);
+    const error = state.error || state.experiment?.error || state.session?.error || state.session?.save_error;
+    const invalidPeaks = normalizePeaks(state.tracker?.peaks).filter(peak => !peak.valid || peak.stale).length;
+    const problem = serviceUnavailable ? "本机服务连接中断，当前采样与保存状态无法确认" : error ? label(error) : state.session?.overflow ? "写盘异常，请查看下方采集状态" : !state.running ? "光谱设备未连接" : elapsed + (state.tracker?.display_age_ms || 0) > 1000 || state.tracker?.display_stale ? "光谱数据已过期，请查看下方采集状态" : !forceSample?.valid ? "PX6D：" + (forceSample?.reason || "当前六轴不可用") : ["error", "failed"].includes(state.tracker?.state) ? label(state.tracker.message || state.tracker.state) : invalidPeaks ? `${invalidPeaks} 路光栅当前无有效测量，请查看下方采集状态` : "";
+    put("captureDisplayHealth", problem ? "当前状态：" + problem : "当前状态：光谱与 PX6D 接收有效，下方采集数据继续更新");
+    $("captureDisplayNotice").classList.toggle("display-freeze-alert", !!problem);
   }
   function inputNumber(id, name) {
     const value = $(id).value.trim();
@@ -160,7 +214,7 @@
     }
     updateControls(); drawSpectrum();
   }
-  const put = (id, value) => { const element = $(id); if (element) element.textContent = value; };
+  const put = (id, value) => { const element = $(id); if (element && element.textContent !== String(value)) element.textContent = value; };
   function notify(message, tone = "info", transient = false) {
     clearTimeout(noticeTimer);
     const node = $("notice"); node.textContent = message; node.className = `notice ${tone}`; node.hidden = !message;
@@ -175,6 +229,7 @@
   }
   async function action(callback) {
     if (busy) return;
+    if (guiPaused()) { notify("脉搏曲线优先，本页操作已暂停；请点击“恢复本页显示”，收到最新状态后再操作。", "info"); return; }
     busy = true; updateControls();
     try { await callback(); await poll(); }
     catch (error) { notify(error instanceof TypeError ? "无法连接本机服务，请检查 9FBG 服务是否正在运行。" : error.message || "操作失败，请检查本机服务。", "error"); }
@@ -191,16 +246,21 @@
     $("px6dConnectBtn").disabled = busy || !state.running || state.mode !== "hardware" || forceConnected || state.force_connecting;
     $("px6dDisconnectBtn").disabled = busy || (!forceConnected && !state.force_connecting);
     for (const id of ["integrationUs", "sampleRateHz"]) $(id).disabled = !!state.running || busy || $("sourceMode").value !== "hardware";
-    if (state.experiment?.running || allowed.pressing || !forceSample?.valid) $("forceUnloadedCheck").checked = false;
-    $("forceZeroBtn").disabled = busy || !forceSample?.valid || !$("forceUnloadedCheck").checked || allowed.pressing || forceZero.snapshot().pending || state.experiment?.running;
-    $("forceZeroReset").disabled = state.experiment?.running || (!forceZero.snapshot().active && !forceZero.snapshot().pending);
-    $("forceUnloadedCheck").disabled = allowed.pressing || forceZero.snapshot().pending || state.experiment?.running;
+    if (captureDisplayActive(state) || allowed.pressing || !forceSample?.valid) $("forceUnloadedCheck").checked = false;
+    $("forceZeroBtn").disabled = busy || !forceSample?.valid || !$("forceUnloadedCheck").checked || allowed.pressing || forceZero.snapshot().pending || captureDisplayActive(state);
+    $("forceZeroReset").disabled = captureDisplayActive(state) || (!forceZero.snapshot().active && !forceZero.snapshot().pending);
+    $("forceUnloadedCheck").disabled = allowed.pressing || forceZero.snapshot().pending || captureDisplayActive(state);
     put("initialCalibrationNote", state.experiment?.running ? "点位会话正在进行：请在采集工作区使用本轮无载标定，首次标定已禁用。" : "先连接光谱与 PX6D，再移开接触棒确认无载并标定；开始点位会话后使用本轮无载标定。");
-    $("spectrumRangeApply").disabled = !display.validateSpectrum(state.frame).valid;
+    $("spectrumRangeApply").disabled = !!displayFreeze || !display.validateSpectrum(state.frame).valid;
+    $("spectrumRangeReset").disabled = !!displayFreeze;
+    $("spectrumRangeMode").disabled = !!displayFreeze;
+    $("showWindows").disabled = !!displayFreeze;
     const manualSpectrum = $("spectrumRangeMode").value === "manual";
-    for (const id of ["spectrumXMin", "spectrumXMax", "spectrumYMin", "spectrumYMax"]) $(id).disabled = !manualSpectrum;
+    for (const id of ["spectrumXMin", "spectrumXMax", "spectrumYMin", "spectrumYMax"]) $(id).disabled = !!displayFreeze || !manualSpectrum;
+    if (guiPaused()) for (const id of ["connectBtn", "disconnectBtn", "sourceMode", "px6dConnectBtn", "px6dDisconnectBtn", "integrationUs", "sampleRateHz", "forceZeroBtn", "forceZeroReset", "forceUnloadedCheck", "spectrumRangeApply", "spectrumRangeReset", "spectrumRangeMode", "showWindows", "spectrumXMin", "spectrumXMax", "spectrumYMin", "spectrumYMax"]) $(id).disabled = true;
   }
   function renderPeaks(peaks) {
+    if (displayHeld()) return;
     const renderKey = JSON.stringify([state.frame?.stream_epoch, state.frame?.frame_id, state.frame?.host_rx_monotonic_ns,
       state.tracker?.reference_version, state.tracker?.config_version, state.tracker?.algorithm_version,
       state.tracker?.display_stale === true,
@@ -230,9 +290,11 @@
     return `${uniform === true ? "均匀波长轴" : uniform === false ? "非均匀波长轴" : "波长轴均匀性待核实"}${finite(spacing) ? ` · 采样间隔 ${fmt(spacing, 5)} nm` : ""} · ${prepText}`;
   }
   function renderReference(tracker, allowed) {
+    if (!displayHeld()) {
     put("referenceVersion", allowed.referenced ? `第 ${tracker.reference_version} 版` : "未建立");
     put("freezeStatus", allowed.pressing ? "按压期间冻结" : allowed.referenced ? "无载确认后可更新" : "等待无载确认");
     $("freezeDot").className = `status-dot ${allowed.pressing ? "warn" : allowed.referenced ? "good" : ""}`;
+    }
     put("referenceState", allowed.pressing ? "已冻结 · 本次按压" : allowed.referenced ? "已建立 · 等待按压" : "尚未建立");
     put("algorithmVersion", tracker.algorithm_version || "—");
     put("configVersion", tracker.config_version || "—");
@@ -243,15 +305,17 @@
   function renderForce(force, sync) {
     forceSample = currentForce();
     const zero = forceZero.update(forceSample);
-    const forceValues = forceSample.valid ? forceZero.correct(forceSample.values) : null;
-    $("forceGrid").innerHTML = display.AXES.map((axis, index) => {
+    if (!displayHeld()) {
+      const forceValues = forceSample.valid ? forceZero.correct(forceSample.values) : null;
+      $("forceGrid").innerHTML = display.AXES.map((axis, index) => {
       const unit = display.UNITS[index], digits = index < 3 ? 3 : 5, raw = forceSample.values?.[index], offset = zero.offsets?.[index] ?? 0;
       return '<div class="force-axis"><span>' + axis + '</span><strong class="force-value">' + (forceValues ? fmt(forceValues[index], digits) : "—") + '</strong><small>' + unit + '</small><div class="force-raw">' + (forceSample.valid ? "原始 " : "原始旧值 ") + fmt(raw, digits) + ' ' + unit + '</div><div class="force-offset">显示零点 ' + fmt(offset, digits) + ' ' + unit + '</div></div>';
-    }).join("");
+      }).join("");
+    }
     const synced = forceSample.valid && !state.tracker?.display_stale && sync?.valid === true;
-    put("syncState", !forceSample.valid ? (force ? "六轴无效 / 旧值" : "尚未连接 PX6D") : synced ? "六轴实时 · 近似配对" : "六轴实时 · 未配对光谱");
-    $("syncState").className = "quality-pill " + (forceSample.valid ? "good" : force ? "warn" : "neutral");
-    put("syncDetail", forceSample.valid ? "显示最新六轴接收值 · " + (finite(force?.age_ms) ? "距接收 " + fmt(force.age_ms, 0) + " ms · " : "") + (synced ? "光谱仅按主机接收时间近似配对" : "当前光谱配对无效；六轴显示独立更新") : forceSample.reason);
+    put("syncState", displayFreeze ? "六轴显示已冻结" : !forceSample.valid ? (force ? "六轴无效 / 旧值" : "尚未连接 PX6D") : synced ? "六轴实时 · 近似配对" : "六轴实时 · 未配对光谱");
+    $("syncState").className = "quality-pill " + (displayFreeze ? "warn" : forceSample.valid ? "good" : force ? "warn" : "neutral");
+    put("syncDetail", displayFreeze ? "数值为采集开始时的快照；当前六轴与本轮力值请查看下方采集区。" : forceSample.valid ? "显示最新六轴接收值 · " + (finite(force?.age_ms) ? "距接收 " + fmt(force.age_ms, 0) + " ms · " : "") + (synced ? "光谱仅按主机接收时间近似配对" : "当前光谱配对无效；六轴显示独立更新") : forceSample.reason);
     put("forceDisplayZeroStatus", zero.pending ? "正在建立无载显示零点 " + zero.count + "/" + zero.required + " 帧" : zero.active ? "显示零点已生效 · 第 " + zero.version + " 版 · 原始值减显示零点" : !forceSample.valid ? forceSample.reason : "尚未标定 · 显示设备原始值" + (zero.version > 0 ? " · 上次显示零点已失效，请重新标定" : ""));
     $("forceDisplayZeroStatus").title = zero.reason || "";
   }
@@ -264,13 +328,19 @@
     }
   }
   function renderState() {
+    if (guiPaused()) { renderGuiPriority(); updateControls(); return; }
+    updateDisplayFreeze();
+    wavelengthChart?.setFrozen(!!displayFreeze);
     const tracker = state.tracker || {}, frame = state.frame, metrics = state.metrics || {};
     const peaks = normalizePeaks(tracker.peaks), allowed = gates(state, false, false, busy);
-    const version = state.version || "0.7.1";
-    put("version", version); put("footerVersion", version);
+    put("version", UI_VERSION); put("footerVersion", UI_VERSION);
+    const serviceVersion = state.version && state.version !== UI_VERSION ? "服务 " + state.version : "";
+    put("serviceVersion", serviceVersion); $("serviceVersion").hidden = !serviceVersion;
+    put("footerServiceVersion", serviceVersion ? " · " + serviceVersion : ""); $("footerServiceVersion").hidden = !serviceVersion;
     put("modeBadge", state.running ? label(state.mode) : "尚未连接");
     $("runningBadge").className = `live-badge ${state.running ? "active" : ""}`;
-    $("runningBadge").innerHTML = `<i></i>${state.running ? state.mode === "replay" ? "原始数据回放中" : "实时显示中" : "设备未连接"}`;
+    $("runningBadge").innerHTML = `<i></i>${displayFreeze ? state.running ? "采集进行中 · 上方显示已冻结" : "设备未连接 · 上方显示已冻结" : state.running ? state.mode === "replay" ? "原始数据回放中" : "实时显示中" : "设备未连接"}`;
+    if (!displayHeld()) {
     put("validCount", `${peaks.filter(peak => peak.valid && !peak.stale).length} / 9`);
     put("trackerSummary", allowed.referenced ? label(tracker.state) : (Array.isArray(tracker.candidates) ? "可靠候选 " + tracker.candidates.length + "/9 · 等待无载标定" : "等待连接与无载标定"));
     put("newFrameHz", finite(metrics.new_frame_hz) ? `${fmt(metrics.new_frame_hz, 1)} Hz` : "未知");
@@ -285,15 +355,17 @@
     put("identicalPayloads", `${integer(metrics.identical_payloads)} 帧 · 不等同于已证重复帧`);
     put("queuePeak", `${integer(metrics.max_queue_depth)} 帧 / ${fmt(metrics.processing_p95_ms, 2)} ms`);
     put("frameId", frame?.frame_id ?? "—");
-    put("frameTime", frame?.frame_id != null ? `${tracker.display_stale ? "旧帧 · " : ""}${finite(tracker.display_age_ms) ? `距接收 ${fmt(tracker.display_age_ms, 0)} ms · ` : ""}${label(frame.time_quality, "时间质量尚未核实")}` : "等待数据");
+    put("frameTime", (displayFreeze ? "冻结快照 · " : "") + (frame?.frame_id != null ? `${tracker.display_stale ? "旧帧 · " : ""}${finite(tracker.display_age_ms) ? `距接收 ${fmt(tracker.display_age_ms, 0)} ms · ` : ""}${label(frame.time_quality, "时间质量尚未核实")}` : "等待数据"));
     $("frameTime").classList.toggle("session-warning", tracker.display_stale === true);
     put("timeQuality", label(frame?.time_quality, "等待原始帧"));
     put("timestampSource", label(frame?.timestamp_source));
     put("axisSummary", axisDescription(tracker.axis_diagnostics || {}, frame));
+    put("rawPointCount", `${frame?.wavelength_nm?.length ?? "—"} 点`);
+    renderPeaks(peaks);
+    }
     const warnings = Array.isArray(tracker.warnings) ? [...tracker.warnings] : [];
     if (tracker.windows?.length && tracker.drift_range_verified !== true) warnings.push("跟踪窗口已固定；最大按压漂移范围尚待真实数据确认。");
     put("qualityWarnings", [...new Set(warnings)].join("　·　")); $("qualityWarnings").hidden = !warnings.length;
-    put("rawPointCount", `${frame?.wavelength_nm?.length ?? "—"} 点`);
     const session = state.session || {};
     const saving = !!state.session && session.closed === false;
     const saveError = session.error || session.save_error;
@@ -304,9 +376,12 @@
     put("storageIntegrity", state.experiment?.error ? state.experiment.error : state.experiment?.running ? "正在独立记录原始两路；显示跳帧不会删原始记录" : state.recording === false ? "显示模式 · 不写采集文件" : saveError || session.overflow ? "写盘异常 · 数据不完整" : state.session ? session.closed ? "已结束 · 查看会话清单" : "正在连续记录原始帧" : "等待会话");
     $("storageIntegrity").classList.toggle("session-warning", !!saveError || !!session.overflow);
     put("sessionPath", state.experiment?.running ? "点位实验正在独立记录原始两路数据：" + state.experiment.path : state.recording === false ? "本页显示不自动记录；在采集工作区明确开始会话后记录" : session.path || session.directory || "原始帧 ID、采集时间戳与质量随测量结果保留");
-    renderPeaks(peaks); renderReference(tracker, allowed); renderForce(state.force, state.sync); renderDevices(); updateControls();
+    renderReference(tracker, allowed); renderForce(state.force, state.sync); renderDevices(); updateControls();
     drawSpectrum();
-    global.NineFBGExperiment?.render(state);
+    wavelengthChart?.update(state, stateReceivedAt);
+    if (displayFreeze) displayFreeze.painted = true;
+    renderDisplayFreezeStatus();
+    global.NineFBGExperiment?.render(state, true);
     const error = state.error || saveError;
     if (error && error !== lastError) { notify(label(error), "error"); lastError = error; }
     else if (!error) lastError = "";
@@ -316,38 +391,61 @@
     }
   }
   async function poll() {
-    if (polling || !active) return;
+    if (polling || !active || guiFrozen()) return;
     polling = true;
+    const requestEpoch = guiStateEpoch;
     const controller = typeof global.AbortController === "function" ? new global.AbortController() : null;
     const timeout = controller ? setTimeout(() => controller.abort(), 1500) : null;
     try {
       const response = await fetch("/api/state", { cache: "no-store", ...(controller ? { signal: controller.signal } : {}) });
       if (!response.ok) throw new Error(`状态服务响应 ${response.status}`);
-      state = await response.json();
+      const nextState = await response.json();
+      // A request that began before pulse priority may finish afterwards.
+      // Discard it without painting a fresh-looking paused snapshot.
+      if (guiFrozen() || requestEpoch !== guiStateEpoch) return;
+      state = nextState;
+      serviceUnavailable = false;
       stateReceivedAt = Date.now();
+      guiNeedsFreshState = false;
+      renderGuiPriority();
       $("serverDot").className = "status-dot good"; put("serverStatus", "本机服务已连接");
       renderState();
     } catch (error) {
+      if (guiFrozen() || requestEpoch !== guiStateEpoch) return;
+      guiNeedsFreshState = false;
+      renderGuiPriority();
+      serviceUnavailable = true;
       $("serverDot").className = "status-dot bad"; put("serverStatus", "本机服务连接中断");
+      wavelengthChart?.update(null, Date.now());
+      wavelengthChart?.setFrozen(!!displayFreeze);
+      global.NineFBGExperiment?.render(null, true);
       if (state.running) {
         put("runningBadge", "服务中断 · 状态未更新"); $("runningBadge").className = "live-badge";
         state.tracker = { ...(state.tracker || {}), display_stale: true, peaks: normalizePeaks(state.tracker?.peaks).map(peak => ({ ...peak, valid: false, stale: true, failure_reason: "本机服务连接中断，当前数据未更新" })) };
         state.force = state.force ? { ...state.force, stale: true, valid: false } : null;
         renderForce(state.force, null); updateControls();
-        renderPeaks(state.tracker.peaks); put("validCount", "0 / 9"); put("frameTime", "旧帧 · 本机服务连接中断"); $("frameTime").classList.add("session-warning"); drawSpectrum();
+        renderPeaks(state.tracker.peaks);
+        if (!displayHeld()) { put("validCount", "0 / 9"); put("frameTime", "旧帧 · 本机服务连接中断"); $("frameTime").classList.add("session-warning"); }
+        drawSpectrum();
         notify("本机服务连接中断。屏幕数据为上次状态，不能作为当前有效测量。", "error");
       }
+      renderDisplayFreezeStatus();
       // Never reconnect devices automatically after a page or network interruption.
     } finally { if (timeout != null) clearTimeout(timeout); polling = false; }
   }
   function refreshStaleness() {
+    if (guiPaused()) return;
+    if (active) wavelengthChart?.tick(Date.now());
     if (!active || !state.running) return;
     const elapsed = Math.max(0, Date.now() - stateReceivedAt);
     if (forceSample?.valid && !currentForce().valid) { renderForce(state.force, state.sync); updateControls(); }
     if (elapsed + (state.tracker?.display_age_ms || 0) > 1000 && !state.tracker?.display_stale) {
       state.tracker = { ...(state.tracker || {}), display_stale: true, peaks: normalizePeaks(state.tracker?.peaks).map(peak => ({ ...peak, valid: false, stale: true, failure_reason: "状态超过 1 秒未更新" })) };
-      renderPeaks(state.tracker.peaks); put("validCount", "0 / 9"); put("frameTime", "旧帧 · 状态超过 1 秒未更新"); $("frameTime").classList.add("session-warning"); drawSpectrum();
+      renderPeaks(state.tracker.peaks);
+      if (!displayHeld()) { put("validCount", "0 / 9"); put("frameTime", "旧帧 · 状态超过 1 秒未更新"); $("frameTime").classList.add("session-warning"); }
+      drawSpectrum();
     }
+    renderDisplayFreezeStatus();
   }
   function chart(canvas, title, unit, xRange, yRange, yDigits = 0) {
     const bounds = canvas.getBoundingClientRect(), ratio = Math.min(global.devicePixelRatio || 1, 2);
@@ -357,9 +455,9 @@
     const area = { x: 63, y: 23, w: width - 85, h: height - 62 };
     const x = value => area.x + (value - xRange[0]) / (xRange[1] - xRange[0]) * area.w;
     const y = value => area.y + area.h - (value - yRange[0]) / (yRange[1] - yRange[0]) * area.h;
-    ctx.font = '9px Consolas,"Microsoft YaHei UI",sans-serif'; ctx.fillStyle = "#738395";
+    ctx.font = '9px Consolas,"Microsoft YaHei UI",sans-serif'; ctx.fillStyle = "#536779";
     ctx.textAlign = "left"; ctx.fillText(title, 17, 12);
-    ctx.strokeStyle = "#2a333e"; ctx.lineWidth = 1;
+    ctx.strokeStyle = "#d9e2e9"; ctx.lineWidth = 1;
     const yTicks = display.axisTicks(yRange, 4), yPrecision = Math.min(8, Math.max(yDigits, yTicks.digits));
     const xTicks = display.axisTicks(xRange, 5);
     for (let i = 0; i <= 4; i++) {
@@ -370,9 +468,9 @@
     }
     for (let i = 0; i <= 5; i++) {
       const px = area.x + area.w * i / 5;
-      ctx.strokeStyle = "#252e38"; ctx.beginPath(); ctx.moveTo(px + .5, area.y); ctx.lineTo(px + .5, area.y + area.h); ctx.stroke();
+      ctx.strokeStyle = "#e3e9ee"; ctx.beginPath(); ctx.moveTo(px + .5, area.y); ctx.lineTo(px + .5, area.y + area.h); ctx.stroke();
       const xValue = xRange[0] + (xRange[1] - xRange[0]) * i / 5;
-      ctx.fillStyle = "#738395"; ctx.textAlign = "center"; ctx.fillText(unit === "nm" ? fmt(xValue, Math.min(8, Math.max(1, xTicks.digits))) : xTicks.format(xValue), px, height - 23);
+      ctx.fillStyle = "#536779"; ctx.textAlign = "center"; ctx.fillText(unit === "nm" ? fmt(xValue, Math.min(8, Math.max(1, xTicks.digits))) : xTicks.format(xValue), px, height - 23);
     }
     ctx.textAlign = "right"; ctx.fillText(unit === "nm" ? "波长 / nm" : "采集时间 / s", width - 21, height - 5);
     return { ctx, area, x, y, width, height, xRange, yRange };
@@ -384,6 +482,7 @@
     ctx.stroke(); ctx.setLineDash([]);
   }
   function drawSpectrum() {
+    if (displayHeld()) return;
     const frame = state.frame, tracker = state.tracker || {};
     const checked = display.validateSpectrum(frame), present = checked.valid;
     $("spectrumEmpty").hidden = present;
@@ -429,11 +528,11 @@
           g.ctx.setLineDash([]); g.ctx.fillStyle = color; g.ctx.textAlign = "center"; g.ctx.font = "9px Consolas,monospace";
         }
       }
-      line(g, xs, ys, stale ? "#ad8e64" : "#abb8c5", 1.25, stale ? [4, 3] : []);
+      line(g, xs, ys, stale ? "#93632a" : "#596d80", 1.25, stale ? [4, 3] : []);
       if (!tracker.reference_version && !stale) {
         (tracker.candidates || []).forEach((candidate, index) => {
           if (!finite(candidate.index) || !finite(candidate.center_nm) || !finite(ys[candidate.index])) return;
-          g.ctx.fillStyle = "#d0ad76"; g.ctx.beginPath(); g.ctx.arc(g.x(candidate.center_nm), g.y(ys[candidate.index]), 3, 0, Math.PI * 2); g.ctx.fill();
+          g.ctx.fillStyle = "#93632a"; g.ctx.beginPath(); g.ctx.arc(g.x(candidate.center_nm), g.y(ys[candidate.index]), 3, 0, Math.PI * 2); g.ctx.fill();
           g.ctx.textAlign = "center"; g.ctx.fillText("候选 " + (index + 1), g.x(candidate.center_nm), Math.max(g.area.y + 14, g.y(ys[candidate.index]) - 8));
         });
       }
@@ -454,6 +553,7 @@
   $("forceUnloadedCheck").addEventListener("change", updateControls);
   $("spectrumRangeMode").addEventListener("change", updateControls);
   $("spectrumRangeApply").addEventListener("click", () => {
+    if (displayFreeze || guiPaused()) return;
     try {
       if ($("spectrumRangeMode").value === "auto") spectrumView = null;
       else {
@@ -465,13 +565,14 @@
       drawSpectrum(); saveSpectrumSettings(); notify("已应用光谱显示范围。", "success", true);
     } catch (error) { notify(error.message, "error"); }
   });
-  $("spectrumRangeReset").addEventListener("click", () => { spectrumView = restoredSpectrumView = null; $("spectrumRangeMode").value = "auto"; updateControls(); drawSpectrum(); saveSpectrumSettings(); });
+  $("spectrumRangeReset").addEventListener("click", () => { if (displayFreeze || guiPaused()) return; spectrumView = restoredSpectrumView = null; $("spectrumRangeMode").value = "auto"; updateControls(); drawSpectrum(); saveSpectrumSettings(); });
   $("px6dConnectBtn").addEventListener("click", () => action(async () => { await request("/api/force/connect", {}); notify("正在独立连接 PX6D，等待六轴原始值。", "info", true); }));
   $("px6dDisconnectBtn").addEventListener("click", () => action(async () => { await request("/api/force/disconnect", {}); forceZero.reset(); notify("PX6D 已断开，光谱继续显示。", "info", true); }));
   $("forceZeroBtn").addEventListener("click", () => action(async () => {
     if (!$("forceUnloadedCheck").checked) throw new Error("请先移开接触棒并确认当前无载荷。");
     await poll();
-    if (state.experiment?.running) throw new Error("点位会话正在进行，请使用采集工作区的本轮无载标定。");
+    if (guiPaused()) throw new Error("脉搏曲线优先，本页已暂停；恢复显示并重新确认无载后再标定。");
+    if (captureDisplayActive(state)) throw new Error("采集会话正在进行，请使用采集工作区的本轮无载标定。");
     if (gates(state, false, false, busy).pressing) throw new Error("请结束按压、移开接触棒后重新确认无载。");
     const force = currentForce();
     if (!force.valid) throw new Error(force.reason);
@@ -480,7 +581,7 @@
     $("forceUnloadedCheck").checked = false;
     notify("正在建立九峰无载参考与六轴显示零点，请保持无载。", "info");
   }));
-  $("forceZeroReset").addEventListener("click", () => { if (state.experiment?.running) return; forceZero.reset(); renderForce(state.force, state.sync); updateControls(); notify("已恢复六轴原始值显示。", "info", true); });
+  $("forceZeroReset").addEventListener("click", () => { if (guiPaused() || captureDisplayActive(state)) return; forceZero.reset(); renderForce(state.force, state.sync); updateControls(); notify("已恢复六轴原始值显示。", "info", true); });
   $("showWindows").addEventListener("change", drawSpectrum);
   $("connectBtn").addEventListener("click", () => action(async () => {
     const payload = { mode: "hardware", record: false, connect_force: false,
@@ -491,6 +592,7 @@
   }));
   $("disconnectBtn").addEventListener("click", () => action(async () => { await request("/api/disconnect", {}); forceZero.reset(); notify("设备已断开。", "info", true); }));
   $("spectrumChart").addEventListener("mousemove", event => {
+    if (displayFreeze || guiPaused()) { $("spectrumTooltip").hidden = true; return; }
     if (!rawGeometry || !state.frame) return;
     const rect = event.currentTarget.getBoundingClientRect(), px = event.clientX - rect.left, py = event.clientY - rect.top;
     const g = rawGeometry, tooltip = $("spectrumTooltip");
@@ -506,6 +608,19 @@
   else global.addEventListener("resize", drawSpectrum);
   global.addEventListener("pagehide", () => { active = false; });
   global.addEventListener("pageshow", () => { active = true; poll(); });
+  $("guiPriorityResume").addEventListener("click", () => { guiPriority?.requestResume(); });
+  guiPriority?.subscribe(() => {
+    guiStateEpoch++;
+    guiNeedsFreshState = true;
+    if (guiFrozen()) {
+      $("forceUnloadedCheck").checked = false;
+      if (forceZero.snapshot().pending) forceZero.reset();
+    }
+    wavelengthChart?.setFrozen(true);
+    renderGuiPriority(); updateControls();
+    if (!guiFrozen()) poll();
+  });
+  if (guiPaused()) { wavelengthChart?.setFrozen(true); renderGuiPriority(); }
   renderState(); poll(); setInterval(poll, 100); setInterval(refreshStaleness, 100);
   global.NineFBGPreferences?.bind("connection", {
     source_mode: { id: "sourceMode", type: "string" }, integration_us: { id: "integrationUs", type: "number" }, sample_rate_hz: { id: "sampleRateHz", type: "number" }

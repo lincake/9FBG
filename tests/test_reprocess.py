@@ -5,6 +5,7 @@ import json
 import pytest
 
 from ninefbg.experiment import AXES, IDS, UNITS
+from ninefbg.capture_setup import SETUP_POLICY
 from ninefbg.reprocess import FEATURE_PROCESSING, reprocess_session
 from ninefbg.tracking import PeakTracker, digest
 from test_tracking import make_frame
@@ -81,6 +82,21 @@ def test_replays_every_raw_frame_with_recorded_ids_baseline_and_immutable_source
         assert row["force_N"] == 1 and row["force_corrected"] == [0, 0, -1, 0, 0, 0]
         assert row["point_id"] == ("P01" if frame["phase"] in ("loading", "hold") else None)
     assert original == (manifest, raw, forces)
+    assert before == {file.name: file.read_bytes() for file in tmp_path.iterdir()}
+
+
+@pytest.mark.parametrize("policy", [None, SETUP_POLICY])
+def test_replay_respects_recorded_setup_policy_without_mutating_legacy_attestations(tmp_path, policy):
+    manifest, _, _ = _archive(tmp_path)
+    manifest["settings"].update(force_direction_confirmed=False, coordinates_confirmed=False)
+    if policy is not None:
+        manifest["settings"]["setup_policy"] = policy
+    before = {file.name: file.read_bytes() for file in tmp_path.iterdir()}
+    original = deepcopy(manifest)
+    rows = reprocess_session(tmp_path, manifest)
+    assert len(rows) == 6
+    assert all(row["valid"] is (policy == SETUP_POLICY) for row in rows)
+    assert manifest == original
     assert before == {file.name: file.read_bytes() for file in tmp_path.iterdir()}
 
 
